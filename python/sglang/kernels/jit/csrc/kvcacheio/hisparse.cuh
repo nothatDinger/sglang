@@ -834,6 +834,152 @@ void load_cache_to_device_buffer(
   }
 }
 
+// Classify top-k residency without assigning or evicting any cache slot.
+//
+// CPU-miss attention needs the resident subset on GPU and the non-resident
+// subset in host memory at the same time.  Reusing the full swap kernel with
+// SkipIO is incorrect because that kernel still mutates device_buffer_tokens
+// and LRU state as if the bytes had been copied.
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, typename SeqLensT, typename ReqPoolIndicesT>
+__global__ void classify_cache_residency_kernel(
+    const int32_t* __restrict__ top_k_tokens,
+    const int32_t* __restrict__ device_buffer_tokens,
+    const int64_t* __restrict__ host_cache_locs,
+    const int32_t* __restrict__ device_buffer_locs,
+    int32_t* __restrict__ hit_device_locs,
+    int64_t* __restrict__ miss_host_locs,
+    int32_t* __restrict__ miss_count,
+    const ReqPoolIndicesT* __restrict__ req_pool_indices,
+    const SeqLensT* __restrict__ seq_lens,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t buffer_stride,
+    int64_t host_stride,
+    int64_t top_k_stride,
+    int64_t hit_stride,
+    int64_t miss_stride) {
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  int32_t* req_hit_locs = hit_device_locs + bid * hit_stride;
+  int64_t* req_miss_locs = miss_host_locs + bid * miss_stride;
+
+  if (tid == 0) {
+    miss_count[bid] = 0;
+  }
+  __syncthreads();
+
+  if (bid >= num_real_reqs[0]) {
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      req_hit_locs[i] = -1;
+      req_miss_locs[i] = -1;
+    }
+    return;
+  }
+
+  const int64_t rid = req_pool_indices[bid];
+  const int64_t seq_len = seq_lens[bid];
+  const int32_t* req_tokens = device_buffer_tokens + rid * buffer_stride;
+  const int32_t* req_device_locs = device_buffer_locs + rid * buffer_stride;
+  const int64_t* req_host_locs = host_cache_locs + rid * host_stride;
+  const int32_t* req_top_k = top_k_tokens + bid * top_k_stride;
+
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    const int32_t token = req_top_k[i];
+    int32_t device_loc = -1;
+    int64_t host_loc = -1;
+
+    if (token >= 0 && token < seq_len) {
+      if (seq_len <= HOT_BUFFER_SIZE) {
+        device_loc = req_device_locs[token];
+      } else if (token == seq_len - 1) {
+        device_loc = req_device_locs[HOT_BUFFER_SIZE];
+      } else {
+        for (int slot = 0; slot < HOT_BUFFER_SIZE; ++slot) {
+          if (req_tokens[slot] == token) {
+            device_loc = req_device_locs[slot];
+            break;
+          }
+        }
+      }
+      if (device_loc < 0) {
+        host_loc = req_host_locs[token];
+        if (host_loc >= 0) {
+          atomicAdd(&miss_count[bid], 1);
+        }
+      }
+    }
+
+    req_hit_locs[i] = device_loc;
+    req_miss_locs[i] = host_loc;
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>
+void classify_cache_residency(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView hit_device_locs,
+    tvm::ffi::TensorView miss_host_locs,
+    tvm::ffi::TensorView miss_count,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView num_real_reqs) {
+  const int64_t bs = top_k_tokens.shape()[0];
+  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+  const int64_t buffer_stride = device_buffer_tokens.strides()[0];
+  const int64_t host_stride = host_cache_locs.strides()[0];
+  const int64_t top_k_stride = top_k_tokens.strides()[0];
+  const int64_t hit_stride = hit_device_locs.strides()[0];
+  const int64_t miss_stride = miss_host_locs.strides()[0];
+
+  auto launch = [&](auto kernel_fn, const auto* seq_ptr, const auto* req_ptr) {
+    LaunchKernel(bs, BLOCK_SIZE, device)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        static_cast<int32_t*>(hit_device_locs.data_ptr()),
+        static_cast<int64_t*>(miss_host_locs.data_ptr()),
+        static_cast<int32_t*>(miss_count.data_ptr()),
+        req_ptr,
+        seq_ptr,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride,
+        host_stride,
+        top_k_stride,
+        hit_stride,
+        miss_stride);
+  };
+
+  const auto seq_dtype = seq_lens.dtype();
+  const auto req_dtype = req_pool_indices.dtype();
+  const bool seq_i64 = seq_dtype.code == kDLInt && seq_dtype.bits == 64;
+  const bool req_i64 = req_dtype.code == kDLInt && req_dtype.bits == 64;
+  if (seq_i64 && req_i64) {
+    launch(
+        classify_cache_residency_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, int64_t, int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else if (seq_i64) {
+    launch(
+        classify_cache_residency_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, int64_t, int32_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  } else if (req_i64) {
+    launch(
+        classify_cache_residency_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, int32_t, int64_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else {
+    launch(
+        classify_cache_residency_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, int32_t, int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  }
+}
+
 // Copy-only swap-in for shared-index skip layers: replays the anchor's recorded
 // miss plan (no hit detection / LRU; the anchor's slot table stays valid). The
 // small fixed grid (num_blocks) keeps the SM footprint low while overlapping

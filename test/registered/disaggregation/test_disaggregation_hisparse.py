@@ -116,6 +116,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             "deepseekv4",
             "--model-loader-extra-config",
             DSV4_FLASH_LOADER_CONFIG,
+            "--disable-decode-cuda-graph",
             "--enable-hisparse",
             "--hisparse-config",
             DSV4_HISPARSE_CONFIG,

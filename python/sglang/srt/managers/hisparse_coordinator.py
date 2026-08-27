@@ -1,11 +1,15 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import time
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    classify_cache_residency_mla,
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
@@ -123,6 +127,12 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        dsv4_prefetch_mode: str = "cpu",
+        dsv4_recall_interval: int = 8,
+        dsv4_cpu_attention_backend: str = "auto",
+        dsv4_cpu_threads: int = 0,
+        dsv4_profile: bool = False,
+        dsv4_profile_log_interval: int = 100,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -138,6 +148,14 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self.dsv4_prefetch_mode = (
+            dsv4_prefetch_mode if self.is_dsv4_hisparse else None
+        )
+        self.dsv4_recall_interval = dsv4_recall_interval
+        self.dsv4_cpu_attention_backend = dsv4_cpu_attention_backend
+        self.dsv4_cpu_threads = dsv4_cpu_threads
+        self.dsv4_profile = dsv4_profile
+        self.dsv4_profile_log_interval = dsv4_profile_log_interval
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -158,6 +176,10 @@ class HiSparseCoordinator:
                 self.mem_pool_device.kv_cache_total_dim
                 * self.mem_pool_device.store_dtype.itemsize
             )
+            # C4 stores 576 data bytes plus 8 UE8M0 scale bytes per token.
+            # The swap kernel ignores item_size_bytes for the page-padded DSV4
+            # layout, but profiling needs the real transfer payload.
+            self.dsv4_item_size_bytes = self.item_size_bytes + 8
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -261,6 +283,10 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+        self._init_dsv4_prefetch(
+            layer_num=layer_num,
+            max_num_req_slots=max_num_req_slots,
+        )
 
     def _init_shared_index_prefetch(
         self,
@@ -315,6 +341,909 @@ class HiSparseCoordinator:
             layer_num,
         )
 
+    def _init_dsv4_prefetch(
+        self,
+        *,
+        layer_num: int,
+        max_num_req_slots: int,
+    ) -> None:
+        self._dsv4_cpu_executor = None
+        self._dsv4_registered_layers = {}
+        self._dsv4_next_csa_layer = {}
+        self._dsv4_compressed_to_physical = {}
+        self._dsv4_prediction_physical_layer = None
+        self._dsv4_prediction_compressed_layer = None
+        self._dsv4_decode_step = 0
+        self._dsv4_periodic_due = False
+        self._dsv4_prediction_allowed = None
+        self._dsv4_num_real_reqs_cpu = 0
+        self._dsv4_profile_data = defaultdict(lambda: defaultdict(list))
+        if not self.is_dsv4_hisparse:
+            return
+
+        self.dsv4_prefetch_stream = device_module.Stream()
+        self.dsv4_d2h_stream = device_module.Stream()
+        self.dsv4_periodic_stream = device_module.Stream()
+        event_kwargs = {"enable_timing": True} if self.dsv4_profile else {}
+        self._dsv4_ready_events = [
+            device_module.Event(**event_kwargs) for _ in range(layer_num)
+        ]
+        self._dsv4_prefetch_start_events = [
+            device_module.Event(**event_kwargs) for _ in range(layer_num)
+        ]
+        self._dsv4_index_end_events = [
+            device_module.Event(**event_kwargs) for _ in range(layer_num)
+        ]
+        self._dsv4_periodic_start_events = [
+            device_module.Event(**event_kwargs) for _ in range(layer_num)
+        ]
+        self._dsv4_periodic_end_events = [
+            device_module.Event(**event_kwargs) for _ in range(layer_num)
+        ]
+        self._dsv4_ready = [False] * layer_num
+        self._dsv4_periodic_pending = [False] * layer_num
+        self._dsv4_batch_num_reqs_cpu = [0] * layer_num
+        self._dsv4_periodic_profile_step = [None] * layer_num
+        self._dsv4_periodic_profile_num_reqs = [0] * layer_num
+        self._dsv4_periodic_profile_by_step = defaultdict(dict)
+
+        shape = (layer_num, max_num_req_slots, self.top_k)
+        self.dsv4_predicted_raw_indices = torch.full(
+            shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.dsv4_predicted_page_indices = torch.full(
+            shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.dsv4_predicted_device_locs = torch.full(
+            shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.dsv4_batch_req_indices = torch.zeros(
+            (layer_num, max_num_req_slots),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.dsv4_batch_seq_lens = torch.zeros(
+            (layer_num, max_num_req_slots),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.dsv4_batch_num_reqs = torch.zeros(
+            (layer_num, 1), dtype=torch.int32, device=self.device
+        )
+        self.dsv4_miss_host_locs: Optional[torch.Tensor] = None
+        self.dsv4_miss_count: Optional[torch.Tensor] = None
+        self._dsv4_cpu_miss_locs: List[torch.Tensor] = []
+        self._dsv4_periodic_miss_count_cpu: List[torch.Tensor] = []
+        if self.dsv4_prefetch_mode == "cpu":
+            self.dsv4_miss_host_locs = torch.full(
+                shape, -1, dtype=torch.int64, device=self.device
+            )
+            self.dsv4_miss_count = torch.zeros(
+                (layer_num, max_num_req_slots),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dsv4_cpu_miss_locs = [
+                torch.empty(
+                    (max_num_req_slots, self.top_k),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _ in range(layer_num)
+            ]
+            if self.dsv4_profile:
+                self._dsv4_periodic_miss_count_cpu = [
+                    torch.empty(
+                        max_num_req_slots,
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    for _ in range(layer_num)
+                ]
+        self._dsv4_cpu_jobs: Dict[
+            int, Tuple[Future, torch.Tensor, torch.Tensor, int]
+        ] = {}
+        self._dsv4_active_cpu_layers: Dict[int, int] = {}
+
+        if self.dsv4_prefetch_mode == "cpu":
+            if self.dsv4_cpu_threads > 0:
+                torch.set_num_threads(self.dsv4_cpu_threads)
+            self._dsv4_cpu_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sglang-dsv4-attn"
+            )
+            cpu_capability = (
+                torch.backends.cpu.get_cpu_capability()
+                if hasattr(torch.backends.cpu, "get_cpu_capability")
+                else "unknown"
+            )
+            logger.info(
+                "DeepSeek-V4 HiSparse CSA prefetch enabled: mode=cpu, "
+                "recall_interval=%d, cpu_backend=%s, cpu_capability=%s, "
+                "torch_threads=%d",
+                self.dsv4_recall_interval,
+                self.dsv4_cpu_attention_backend,
+                cpu_capability,
+                torch.get_num_threads(),
+            )
+        else:
+            logger.info(
+                "DeepSeek-V4 HiSparse CSA prefetch enabled: mode=h2d."
+            )
+
+    def register_dsv4_csa_layers(self, layers) -> None:
+        """Register local CSA modules and derive the next-CSA relation."""
+        if not self.is_dsv4_hisparse or self._dsv4_registered_layers:
+            return
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if (
+                attn is not None
+                and getattr(attn, "compress_ratio", None) == 4
+                and getattr(attn, "indexer", None) is not None
+            ):
+                self._dsv4_registered_layers[attn.layer_id] = attn
+                self._dsv4_compressed_to_physical[
+                    self._dsv4_compressed_layer_id(attn.layer_id)
+                ] = attn.layer_id
+        csa_layers = sorted(self._dsv4_registered_layers)
+        self._dsv4_next_csa_layer = dict(zip(csa_layers, csa_layers[1:]))
+        logger.info(
+            "DeepSeek-V4 HiSparse registered CSA layers=%s; next-CSA prefetch "
+            "uses each source CSA layer's normalized input hidden state.",
+            csa_layers,
+        )
+
+    def begin_decode_step(self, *, num_real_reqs: int) -> None:
+        if not self.is_dsv4_hisparse:
+            return
+        if num_real_reqs < 0:
+            raise ValueError(
+                "DeepSeek-V4 HiSparse real request count must be non-negative, "
+                f"got {num_real_reqs}."
+            )
+        self._dsv4_num_real_reqs_cpu = int(num_real_reqs)
+        self._dsv4_decode_step += 1
+        self._dsv4_prediction_allowed = None
+        self._dsv4_periodic_due = (
+            self.dsv4_prefetch_mode == "cpu"
+            and self.dsv4_recall_interval > 0
+            and self._dsv4_decode_step % self.dsv4_recall_interval == 0
+        )
+        if (
+            self.dsv4_profile
+            and self._dsv4_decode_step % self.dsv4_profile_log_interval == 0
+        ):
+            self._log_dsv4_profile()
+
+    def _dsv4_compressed_layer_id(self, physical_layer_id: int) -> int:
+        return self.token_to_kv_pool_allocator._kvcache.layer_mapping[
+            physical_layer_id
+        ].compress_layer_id
+
+    def is_dsv4_prediction(self, physical_layer_id: int) -> bool:
+        return (
+            self.is_dsv4_hisparse
+            and self._dsv4_prediction_physical_layer == physical_layer_id
+        )
+
+    def dsv4_prediction_buffers(
+        self, physical_layer_id: int, num_queries: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        compressed_layer = self._dsv4_compressed_layer_id(physical_layer_id)
+        assert compressed_layer == self._dsv4_prediction_compressed_layer
+        return (
+            self.dsv4_predicted_raw_indices[compressed_layer, :num_queries],
+            self.dsv4_predicted_page_indices[compressed_layer, :num_queries],
+        )
+
+    def launch_dsv4_next_csa_prefetch(
+        self,
+        *,
+        source_layer_id: int,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        attn_backend,
+    ) -> None:
+        if (
+            not self.is_dsv4_hisparse
+            or not forward_batch.forward_mode.is_decode()
+            or source_layer_id not in self._dsv4_next_csa_layer
+        ):
+            return
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if self._dsv4_prediction_allowed is None:
+            if seq_lens_cpu is None:
+                raise RuntimeError(
+                    "DeepSeek-V4 HiSparse CSA prefetch requires the decode "
+                    "seq_lens_cpu mirror."
+                )
+            num_real_reqs = self._dsv4_num_real_reqs_cpu
+            if num_real_reqs > len(seq_lens_cpu):
+                raise RuntimeError(
+                    "DeepSeek-V4 HiSparse real request count exceeds the "
+                    "padded sequence-length buffer: "
+                    f"real={num_real_reqs}, padded={len(seq_lens_cpu)}."
+                )
+            self._dsv4_prediction_allowed = num_real_reqs > 0 and all(
+                int(seq_len) > self.compress_ratio
+                for seq_len in seq_lens_cpu[:num_real_reqs]
+            )
+        if not self._dsv4_prediction_allowed:
+            # No committed target-layer C4 index exists yet. Let the target CSA
+            # take the same-layer fallback; all of these tokens are resident/SWA.
+            return
+
+        target_layer_id = self._dsv4_next_csa_layer[source_layer_id]
+        target_attn = self._dsv4_registered_layers[target_layer_id]
+        compressed_layer = self._dsv4_compressed_layer_id(target_layer_id)
+        if self._dsv4_ready[compressed_layer]:
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse predicted index was not consumed before "
+                f"the next decode step (layer={target_layer_id})."
+            )
+
+        current_stream = device_module.current_stream()
+        self.dsv4_prefetch_stream.wait_stream(current_stream)
+        with device_module.stream(self.dsv4_prefetch_stream):
+            self._wait_dsv4_periodic(compressed_layer)
+            if self.dsv4_profile:
+                self._dsv4_prefetch_start_events[compressed_layer].record(
+                    self.dsv4_prefetch_stream
+                )
+            self._dsv4_prediction_physical_layer = target_layer_id
+            self._dsv4_prediction_compressed_layer = compressed_layer
+            try:
+                with torch.profiler.record_function(
+                    f"dsv4_hisparse/predict_index/layer_{target_layer_id}"
+                ):
+                    q_lora = target_attn._compute_q_a(x)
+                    target_attn.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        skip_compressor=True,
+                    )
+            finally:
+                self._dsv4_prediction_physical_layer = None
+                self._dsv4_prediction_compressed_layer = None
+        x.record_stream(self.dsv4_prefetch_stream)
+        positions.record_stream(self.dsv4_prefetch_stream)
+
+    def _prepare_dsv4_selection(
+        self,
+        *,
+        compressed_layer: int,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> int:
+        num_reqs = req_pool_indices.size(0)
+        num_real_reqs = self._dsv4_num_real_reqs_cpu
+        if num_real_reqs > num_reqs:
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse real request count exceeds the padded "
+                f"selection batch: real={num_real_reqs}, padded={num_reqs}."
+            )
+        self.dsv4_predicted_raw_indices[compressed_layer, :num_reqs].copy_(
+            top_k_result[:num_reqs]
+        )
+        self.dsv4_batch_req_indices[compressed_layer, :num_reqs].copy_(
+            req_pool_indices.to(torch.int64)
+        )
+        self.dsv4_batch_seq_lens[compressed_layer, :num_reqs].copy_(
+            compressed_seq_lens[:num_reqs].to(torch.int64)
+        )
+        self.dsv4_batch_num_reqs[compressed_layer].fill_(num_real_reqs)
+        self._dsv4_batch_num_reqs_cpu[compressed_layer] = num_real_reqs
+        return num_reqs
+
+    def _run_dsv4_selection(
+        self,
+        *,
+        compressed_layer: int,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        raw_indices = self.dsv4_predicted_raw_indices[
+            compressed_layer, :num_reqs
+        ]
+        req_indices = self.dsv4_batch_req_indices[
+            compressed_layer, :num_reqs
+        ]
+        seq_lens = self.dsv4_batch_seq_lens[compressed_layer, :num_reqs]
+        num_real_reqs = self.dsv4_batch_num_reqs[compressed_layer]
+        output = self.dsv4_predicted_device_locs[
+            compressed_layer, :num_reqs
+        ]
+        num_real_reqs_cpu = self._dsv4_batch_num_reqs_cpu[compressed_layer]
+        if num_real_reqs_cpu < num_reqs:
+            output[num_real_reqs_cpu:].fill_(-1)
+
+        if self.dsv4_prefetch_mode == "h2d":
+            return self._run_swap_in_kernel(
+                req_indices,
+                seq_lens,
+                raw_indices,
+                compressed_layer,
+                output_buffer=output,
+                num_real_reqs=num_real_reqs,
+            )
+
+        assert self.dsv4_miss_host_locs is not None
+        assert self.dsv4_miss_count is not None
+        classify_cache_residency_mla(
+            top_k_tokens=raw_indices,
+            device_buffer_tokens=self.req_device_buffer_tokens[compressed_layer],
+            host_cache_locs=self.req_to_host_pool,
+            device_buffer_locs=self.req_device_buffer_token_locs[compressed_layer],
+            hit_device_locs=output,
+            miss_host_locs=self.dsv4_miss_host_locs[
+                compressed_layer, :num_reqs
+            ],
+            miss_count=self.dsv4_miss_count[compressed_layer, :num_reqs],
+            req_pool_indices=req_indices,
+            seq_lens=seq_lens,
+            hot_buffer_size=self.device_buffer_size,
+            num_real_reqs=num_real_reqs,
+            block_size=256,
+        )
+        return output
+
+    def complete_dsv4_prediction(
+        self,
+        *,
+        physical_layer_id: int,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> None:
+        compressed_layer = self._dsv4_compressed_layer_id(physical_layer_id)
+        assert compressed_layer == self._dsv4_prediction_compressed_layer
+        if self.dsv4_profile:
+            self._dsv4_index_end_events[compressed_layer].record(
+                device_module.current_stream()
+            )
+        num_reqs = self._prepare_dsv4_selection(
+            compressed_layer=compressed_layer,
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=compressed_seq_lens,
+            top_k_result=top_k_result,
+        )
+        with torch.profiler.record_function(
+            f"dsv4_hisparse/prefetch_{self.dsv4_prefetch_mode}/"
+            f"layer_{physical_layer_id}"
+        ):
+            self._run_dsv4_selection(
+                compressed_layer=compressed_layer,
+                num_reqs=num_reqs,
+            )
+        self._dsv4_ready_events[compressed_layer].record(
+            device_module.current_stream()
+        )
+        self._dsv4_ready[compressed_layer] = True
+
+    def process_dsv4_current_index(
+        self,
+        *,
+        physical_layer_id: int,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fallback for the first CSA layer, which has no previous CSA input."""
+        compressed_layer = self._dsv4_compressed_layer_id(physical_layer_id)
+        self._wait_dsv4_periodic(compressed_layer)
+        num_reqs = self._prepare_dsv4_selection(
+            compressed_layer=compressed_layer,
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=compressed_seq_lens,
+            top_k_result=top_k_result,
+        )
+        result = self._run_dsv4_selection(
+            compressed_layer=compressed_layer,
+            num_reqs=num_reqs,
+        )
+        if self.dsv4_prefetch_mode == "cpu":
+            self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
+        return result
+
+    def try_consume_dsv4_prefetch(
+        self,
+        *,
+        physical_layer_id: int,
+        num_reqs: int,
+    ) -> Optional[torch.Tensor]:
+        if not self.is_dsv4_hisparse:
+            return None
+        compressed_layer = self._dsv4_compressed_layer_id(physical_layer_id)
+        if not self._dsv4_ready[compressed_layer]:
+            return None
+
+        current_stream = device_module.current_stream()
+        was_ready = self._dsv4_ready_events[compressed_layer].query()
+        wait_start = wait_end = None
+        if self.dsv4_profile:
+            wait_start = device_module.Event(enable_timing=True)
+            wait_end = device_module.Event(enable_timing=True)
+            wait_start.record(current_stream)
+        self._dsv4_ready_events[compressed_layer].wait(current_stream)
+        if self.dsv4_profile:
+            wait_end.record(current_stream)
+            wait_end.synchronize()
+            self._profile_add(
+                physical_layer_id,
+                "target_wait_ms",
+                wait_start.elapsed_time(wait_end),
+            )
+            self._profile_add(
+                physical_layer_id, "target_blocked", float(not was_ready)
+            )
+            self._profile_add(
+                physical_layer_id,
+                "index_ms",
+                self._dsv4_prefetch_start_events[compressed_layer].elapsed_time(
+                    self._dsv4_index_end_events[compressed_layer]
+                ),
+            )
+            self._profile_add(
+                physical_layer_id,
+                f"{self.dsv4_prefetch_mode}_prefetch_ms",
+                self._dsv4_index_end_events[compressed_layer].elapsed_time(
+                    self._dsv4_ready_events[compressed_layer]
+                ),
+            )
+
+        self._dsv4_ready[compressed_layer] = False
+        if self.dsv4_prefetch_mode == "cpu":
+            self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
+        return self.dsv4_predicted_device_locs[
+            compressed_layer, :num_reqs
+        ]
+
+    def launch_dsv4_cpu_attention(
+        self,
+        *,
+        physical_layer_id: int,
+        q: torch.Tensor,
+        softmax_scale: float,
+        head_dim_v: int,
+    ) -> bool:
+        compressed_layer = self._dsv4_active_cpu_layers.get(physical_layer_id)
+        if compressed_layer is None or self.dsv4_prefetch_mode != "cpu":
+            return False
+        if physical_layer_id in self._dsv4_cpu_jobs:
+            raise RuntimeError(
+                "DeepSeek-V4 CPU attention job already exists for layer "
+                f"{physical_layer_id}"
+            )
+
+        from sglang.srt.layers.attention.dsv4.hisparse_cpu import (
+            cpu_miss_attention,
+        )
+
+        query = q.squeeze(1)
+        num_reqs, num_heads, _ = query.shape
+        num_real_reqs = self._dsv4_batch_num_reqs_cpu[compressed_layer]
+        if num_real_reqs > num_reqs:
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse real request count exceeds the CPU "
+                f"attention batch: real={num_real_reqs}, padded={num_reqs}."
+            )
+        assert self.dsv4_miss_host_locs is not None
+        assert self._dsv4_cpu_miss_locs
+        miss_gpu = self.dsv4_miss_host_locs[
+            compressed_layer, :num_real_reqs
+        ]
+        query_cpu = torch.empty(
+            (num_real_reqs, num_heads, query.shape[-1]),
+            dtype=query.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        miss_cpu = self._dsv4_cpu_miss_locs[compressed_layer][:num_real_reqs]
+        output_cpu = torch.zeros(
+            (num_reqs, num_heads, head_dim_v),
+            dtype=torch.bfloat16,
+            device="cpu",
+            pin_memory=True,
+        )
+        lse_cpu = torch.full(
+            (num_reqs, num_heads),
+            float("-inf"),
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        current_stream = device_module.current_stream()
+        self.dsv4_d2h_stream.wait_stream(current_stream)
+        copy_done = device_module.Event()
+        with device_module.stream(self.dsv4_d2h_stream):
+            query_cpu.copy_(query[:num_real_reqs], non_blocking=True)
+            miss_cpu.copy_(miss_gpu, non_blocking=True)
+            copy_done.record(self.dsv4_d2h_stream)
+
+        host_cache = self.mem_pool_host.kv_buffer[compressed_layer]
+
+        def run_cpu_attention():
+            copy_done.synchronize()
+            with torch.profiler.record_function(
+                f"dsv4_hisparse/cpu_miss_attention/layer_{physical_layer_id}"
+            ):
+                return cpu_miss_attention(
+                    query=query_cpu,
+                    miss_host_locs=miss_cpu,
+                    host_cache=host_cache,
+                    softmax_scale=softmax_scale,
+                    head_dim_v=head_dim_v,
+                    output=output_cpu[:num_real_reqs],
+                    lse=lse_cpu[:num_real_reqs],
+                )
+
+        assert self._dsv4_cpu_executor is not None
+        future = self._dsv4_cpu_executor.submit(run_cpu_attention)
+        self._dsv4_cpu_jobs[physical_layer_id] = (
+            future,
+            output_cpu,
+            lse_cpu,
+            time.perf_counter_ns(),
+        )
+        return True
+
+    def finish_dsv4_cpu_attention(
+        self,
+        *,
+        physical_layer_id: int,
+        gpu_output: torch.Tensor,
+        gpu_lse: torch.Tensor,
+        attn_sink: Optional[torch.Tensor],
+        gpu_timing_events=None,
+    ) -> torch.Tensor:
+        job = self._dsv4_cpu_jobs.pop(physical_layer_id, None)
+        if job is None:
+            return gpu_output
+        future, output_cpu, lse_cpu, launch_ns = job
+        wait_begin_ns = time.perf_counter_ns()
+        timing = future.result()
+        cpu_wait_ms = (time.perf_counter_ns() - wait_begin_ns) * 1.0e-6
+        cpu_critical_ms = (time.perf_counter_ns() - launch_ns) * 1.0e-6
+
+        from sglang.srt.layers.attention.dsv4.hisparse_cpu import (
+            merge_cpu_gpu_attention,
+        )
+
+        with torch.profiler.record_function(
+            f"dsv4_hisparse/lse_merge/layer_{physical_layer_id}"
+        ):
+            merged = merge_cpu_gpu_attention(
+                gpu_output=gpu_output,
+                gpu_lse=gpu_lse,
+                cpu_output=output_cpu,
+                cpu_lse=lse_cpu,
+                attn_sink=attn_sink,
+            )
+
+        if self.dsv4_profile:
+            self._profile_add(physical_layer_id, "cpu_total_ms", timing.total_ms)
+            self._profile_add(
+                physical_layer_id, "cpu_dequant_ms", timing.dequant_ms
+            )
+            self._profile_add(
+                physical_layer_id, "cpu_qk_softmax_ms", timing.qk_softmax_ms
+            )
+            self._profile_add(physical_layer_id, "cpu_pv_ms", timing.pv_ms)
+            # ScoutAttention returns this host-miss partition's attention
+            # output/LSE to the GPU; it does not recall these KV rows.
+            self._profile_add(
+                physical_layer_id,
+                "cpu_attention_miss_tokens",
+                float(timing.miss_tokens),
+            )
+            self._profile_add(physical_layer_id, "cpu_blocked_ms", cpu_wait_ms)
+            self._profile_add(
+                physical_layer_id,
+                "cpu_critical_ms",
+                cpu_critical_ms,
+            )
+            if gpu_timing_events is not None:
+                gpu_start, gpu_end = gpu_timing_events
+                gpu_end.synchronize()
+                gpu_attention_ms = gpu_start.elapsed_time(gpu_end)
+                self._profile_add(
+                    physical_layer_id,
+                    "gpu_hit_attention_ms",
+                    gpu_attention_ms,
+                )
+                # Both intervals start immediately before the GPU hit kernel
+                # (the CPU interval also includes its small D2H prologue).
+                # Their difference estimates the CPU tail exposed on the
+                # decode critical path after GPU attention can no longer hide it.
+                self._profile_add(
+                    physical_layer_id,
+                    "cpu_unhidden_ms",
+                    max(0.0, cpu_critical_ms - gpu_attention_ms),
+                )
+
+        compressed_layer = self._dsv4_active_cpu_layers.pop(physical_layer_id)
+        self._schedule_dsv4_periodic_recall(
+            physical_layer_id=physical_layer_id,
+            compressed_layer=compressed_layer,
+        )
+        return merged
+
+    def _schedule_dsv4_periodic_recall(
+        self,
+        *,
+        physical_layer_id: int,
+        compressed_layer: int,
+    ) -> None:
+        if not self._dsv4_periodic_due:
+            return
+        assert self.dsv4_prefetch_mode == "cpu"
+        if self._dsv4_periodic_pending[compressed_layer]:
+            raise RuntimeError(
+                "DeepSeek-V4 periodic recall from the previous interval is "
+                "still pending"
+            )
+
+        current_stream = device_module.current_stream()
+        self.dsv4_periodic_stream.wait_stream(current_stream)
+        with device_module.stream(self.dsv4_periodic_stream):
+            if self.dsv4_profile:
+                assert self.dsv4_miss_host_locs is not None
+                assert self.dsv4_miss_count is not None
+                assert self._dsv4_periodic_miss_count_cpu
+                self._dsv4_periodic_start_events[compressed_layer].record(
+                    self.dsv4_periodic_stream
+                )
+            num_reqs = self.dsv4_batch_num_reqs[compressed_layer]
+            # num_reqs is a device scalar; buffers are fixed-capacity and the
+            # kernel uses num_real_reqs to ignore the padded rows.
+            self._run_swap_in_kernel(
+                self.dsv4_batch_req_indices[compressed_layer],
+                self.dsv4_batch_seq_lens[compressed_layer],
+                self.dsv4_predicted_raw_indices[compressed_layer],
+                compressed_layer,
+                record_plan=self.dsv4_profile,
+                output_buffer=self.dsv4_predicted_device_locs[compressed_layer],
+                num_real_reqs=num_reqs,
+                miss_src_buffer=(
+                    self.dsv4_miss_host_locs[compressed_layer]
+                    if self.dsv4_profile
+                    else None
+                ),
+                miss_dst_buffer=(
+                    self.dsv4_predicted_page_indices[compressed_layer]
+                    if self.dsv4_profile
+                    else None
+                ),
+                miss_count_buffer=(
+                    self.dsv4_miss_count[compressed_layer]
+                    if self.dsv4_profile
+                    else None
+                ),
+            )
+            if self.dsv4_profile:
+                num_reqs_cpu = self._dsv4_batch_num_reqs_cpu[compressed_layer]
+                self._dsv4_periodic_miss_count_cpu[compressed_layer][
+                    :num_reqs_cpu
+                ].copy_(
+                    self.dsv4_miss_count[compressed_layer, :num_reqs_cpu],
+                    non_blocking=True,
+                )
+            self._dsv4_periodic_end_events[compressed_layer].record(
+                self.dsv4_periodic_stream
+            )
+        self._dsv4_periodic_pending[compressed_layer] = True
+        if self.dsv4_profile:
+            self._dsv4_periodic_profile_step[
+                compressed_layer
+            ] = self._dsv4_decode_step
+            self._dsv4_periodic_profile_num_reqs[
+                compressed_layer
+            ] = self._dsv4_batch_num_reqs_cpu[compressed_layer]
+
+    def _wait_dsv4_periodic(self, compressed_layer: int) -> None:
+        if not self._dsv4_periodic_pending[compressed_layer]:
+            return
+        current_stream = device_module.current_stream()
+        was_ready = self._dsv4_periodic_end_events[compressed_layer].query()
+        if self.dsv4_profile:
+            wait_start = device_module.Event(enable_timing=True)
+            wait_end = device_module.Event(enable_timing=True)
+            wait_start.record(current_stream)
+            self._dsv4_periodic_end_events[compressed_layer].wait(current_stream)
+            wait_end.record(current_stream)
+            wait_end.synchronize()
+            recall_ms = self._dsv4_periodic_start_events[
+                compressed_layer
+            ].elapsed_time(self._dsv4_periodic_end_events[compressed_layer])
+            wait_ms = wait_start.elapsed_time(wait_end)
+            physical_layer_id = self._dsv4_compressed_to_physical[compressed_layer]
+            self._profile_add(
+                physical_layer_id,
+                "periodic_kv_recall_ms",
+                recall_ms,
+            )
+            self._profile_add(
+                physical_layer_id,
+                "periodic_kv_recall_wait_ms",
+                wait_ms,
+            )
+            self._profile_add(
+                physical_layer_id,
+                "periodic_kv_recall_blocked",
+                float(not was_ready),
+            )
+            self._collect_dsv4_periodic_profile(
+                compressed_layer=compressed_layer,
+                recall_ms=recall_ms,
+                wait_ms=wait_ms,
+                blocked=not was_ready,
+            )
+        else:
+            self._dsv4_periodic_end_events[compressed_layer].wait(current_stream)
+        self._dsv4_periodic_pending[compressed_layer] = False
+
+    def _collect_dsv4_periodic_profile(
+        self,
+        *,
+        compressed_layer: int,
+        recall_ms: float,
+        wait_ms: float,
+        blocked: bool,
+    ) -> None:
+        step = self._dsv4_periodic_profile_step[compressed_layer]
+        num_reqs = self._dsv4_periodic_profile_num_reqs[compressed_layer]
+        if step is None:
+            raise RuntimeError(
+                "DeepSeek-V4 periodic recall completed without profile metadata"
+            )
+
+        per_req_misses = self._dsv4_periodic_miss_count_cpu[compressed_layer][
+            :num_reqs
+        ].tolist()
+        miss_tokens = sum(per_req_misses)
+        recall_bytes = miss_tokens * self.dsv4_item_size_bytes
+        physical_layer_id = self._dsv4_compressed_to_physical[compressed_layer]
+        miss_mean = miss_tokens / num_reqs if num_reqs else 0.0
+        miss_p50 = self._profile_percentile(per_req_misses, 0.50)
+        miss_p95 = self._profile_percentile(per_req_misses, 0.95)
+        miss_max = max(per_req_misses, default=0)
+
+        self._profile_add(
+            physical_layer_id,
+            "periodic_kv_recall_miss_tokens",
+            float(miss_tokens),
+        )
+        self._profile_add(
+            physical_layer_id,
+            "periodic_kv_recall_bytes",
+            float(recall_bytes),
+        )
+        logger.info(
+            "DeepSeek-V4 HiSparse periodic KV recall step=%d layer=%d "
+            "num_reqs=%d periodic_kv_recall_miss_tokens=%d "
+            "kv_miss_per_req_mean=%.3f kv_miss_per_req_p50=%d "
+            "kv_miss_per_req_p95=%d kv_miss_per_req_max=%d "
+            "kv_recall_bytes=%d kv_recall_ms=%.3f "
+            "kv_recall_wait_ms=%.3f kv_recall_blocked=%s",
+            step,
+            physical_layer_id,
+            num_reqs,
+            miss_tokens,
+            miss_mean,
+            miss_p50,
+            miss_p95,
+            miss_max,
+            recall_bytes,
+            recall_ms,
+            wait_ms,
+            blocked,
+        )
+
+        step_layers = self._dsv4_periodic_profile_by_step[step]
+        if physical_layer_id in step_layers:
+            raise RuntimeError(
+                "DeepSeek-V4 periodic recall profile was collected twice for "
+                f"step={step}, layer={physical_layer_id}"
+            )
+        step_layers[physical_layer_id] = miss_tokens
+        expected_layers = set(self._dsv4_registered_layers)
+        if expected_layers and expected_layers.issubset(step_layers):
+            misses_by_layer = {
+                layer_id: step_layers[layer_id]
+                for layer_id in sorted(expected_layers)
+            }
+            layer_misses = list(misses_by_layer.values())
+            minimum = min(layer_misses)
+            maximum = max(layer_misses)
+            logger.info(
+                "DeepSeek-V4 HiSparse periodic KV recall layer comparison "
+                "step=%d kv_recall_miss_tokens_by_layer=%s min=%d max=%d "
+                "mean=%.3f spread=%d",
+                step,
+                misses_by_layer,
+                minimum,
+                maximum,
+                sum(layer_misses) / len(layer_misses),
+                maximum - minimum,
+            )
+            del self._dsv4_periodic_profile_by_step[step]
+
+        self._dsv4_periodic_profile_step[compressed_layer] = None
+        self._dsv4_periodic_profile_num_reqs[compressed_layer] = 0
+
+    def _flush_dsv4_periodic_recalls(self) -> None:
+        for compressed_layer, pending in enumerate(self._dsv4_periodic_pending):
+            if pending:
+                self._wait_dsv4_periodic(compressed_layer)
+        # Without profiling, _wait_dsv4_periodic only inserts stream waits.
+        # The host-side synchronization is still required before request or
+        # coordinator resources can be released.
+        self.dsv4_periodic_stream.synchronize()
+
+    def _profile_add(self, layer_id: int, metric: str, value: float) -> None:
+        if self.dsv4_profile:
+            self._dsv4_profile_data[layer_id][metric].append(float(value))
+
+    @staticmethod
+    def _profile_percentile(values: List[float], fraction: float) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        index = min(len(ordered) - 1, int((len(ordered) - 1) * fraction))
+        return ordered[index]
+
+    def _log_dsv4_profile(self) -> None:
+        for layer_id, metrics in self._dsv4_profile_data.items():
+            summary = {}
+            for name, values in metrics.items():
+                if not values:
+                    continue
+                summary[name] = {
+                    "mean": sum(values) / len(values),
+                    "p50": self._profile_percentile(values, 0.50),
+                    "p95": self._profile_percentile(values, 0.95),
+                    "max": max(values),
+                }
+            prefetch_name = f"{self.dsv4_prefetch_mode}_prefetch_ms"
+            if prefetch_name in metrics and "target_wait_ms" in metrics:
+                prefetch_mean = sum(metrics[prefetch_name]) / len(
+                    metrics[prefetch_name]
+                )
+                wait_mean = sum(metrics["target_wait_ms"]) / len(
+                    metrics["target_wait_ms"]
+                )
+                summary["prefetch_overlap_coverage"] = (
+                    max(0.0, 1.0 - wait_mean / prefetch_mean)
+                    if prefetch_mean > 0
+                    else 1.0
+                )
+            if "cpu_critical_ms" in metrics and "cpu_unhidden_ms" in metrics:
+                cpu_critical_mean = sum(metrics["cpu_critical_ms"]) / len(
+                    metrics["cpu_critical_ms"]
+                )
+                cpu_unhidden_mean = sum(metrics["cpu_unhidden_ms"]) / len(
+                    metrics["cpu_unhidden_ms"]
+                )
+                summary["attention_overlap_coverage"] = (
+                    max(0.0, 1.0 - cpu_unhidden_mean / cpu_critical_mean)
+                    if cpu_critical_mean > 0
+                    else 1.0
+                )
+            logger.info(
+                "DeepSeek-V4 HiSparse profile step=%d layer=%d %s",
+                self._dsv4_decode_step,
+                layer_id,
+                summary,
+            )
+        self._dsv4_profile_data.clear()
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -326,6 +1255,14 @@ class HiSparseCoordinator:
         if self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
+        if self.is_dsv4_hisparse:
+            self.dsv4_prefetch_stream.synchronize()
+            self.dsv4_d2h_stream.synchronize()
+            self._flush_dsv4_periodic_recalls()
+            if self.dsv4_profile and self._dsv4_profile_data:
+                self._log_dsv4_profile()
+        if self._dsv4_cpu_executor is not None:
+            self._dsv4_cpu_executor.shutdown(wait=True)
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -891,6 +1828,12 @@ class HiSparseCoordinator:
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+        if self.is_dsv4_hisparse:
+            # A periodic recall may still read this request's pinned host rows
+            # and write its device-buffer slots after the model forward returns.
+            # Drain it and collect its profile before either allocation can be
+            # released or reused.
+            self._flush_dsv4_periodic_recalls()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -941,29 +1884,68 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         record_plan: bool = False,
+        output_buffer: Optional[torch.Tensor] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
+        miss_src_buffer: Optional[torch.Tensor] = None,
+        miss_dst_buffer: Optional[torch.Tensor] = None,
+        miss_count_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
-        record_plan (set on the anchor of a shared-index group) also records the
-        miss plan into self._miss_{src,dst,count} for the skip layers to replay.
+        record_plan also records the miss plan. Shared-index prefetch uses the
+        coordinator-wide default buffers; callers may provide explicit buffers
+        when the plan is only needed for profiling.
         """
         num_reqs = req_pool_indices.size(0)
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        top_k_indices = (
+            self.top_k_device_locs_buffer[:num_reqs]
+            if output_buffer is None
+            else output_buffer
+        )
+        num_real_reqs = (
+            num_real_reqs
+            if num_real_reqs is not None
+            else self.num_real_reqs
+        )
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        plan = (
-            dict(
-                miss_src=self._miss_src[:num_reqs],
-                miss_dst=self._miss_dst[:num_reqs],
-                miss_count=self._miss_count[:num_reqs],
+        if record_plan:
+            explicit_plan = (
+                miss_src_buffer,
+                miss_dst_buffer,
+                miss_count_buffer,
             )
-            if record_plan
-            else {}
-        )
+            if any(buffer is not None for buffer in explicit_plan) and not all(
+                buffer is not None for buffer in explicit_plan
+            ):
+                raise ValueError(
+                    "miss_src_buffer, miss_dst_buffer, and miss_count_buffer "
+                    "must be provided together"
+                )
+            if miss_src_buffer is None:
+                miss_src_buffer = self._miss_src
+                miss_dst_buffer = self._miss_dst
+                miss_count_buffer = self._miss_count
+            plan = dict(
+                miss_src=miss_src_buffer[:num_reqs],
+                miss_dst=miss_dst_buffer[:num_reqs],
+                miss_count=miss_count_buffer[:num_reqs],
+            )
+        else:
+            if any(
+                buffer is not None
+                for buffer in (
+                    miss_src_buffer,
+                    miss_dst_buffer,
+                    miss_count_buffer,
+                )
+            ):
+                raise ValueError("miss-plan buffers require record_plan=True")
+            plan = {}
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -980,7 +1962,7 @@ class HiSparseCoordinator:
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=num_real_reqs,
             skip_io=self.skip_io,
             **plan,
         )

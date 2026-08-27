@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_deepseek_v4,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -877,6 +878,34 @@ class ModelRunner:
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
+        if is_deepseek_v4(self.model_config.hf_text_config):
+            from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+            from sglang.srt.runtime_context import get_exec
+            from sglang.srt.utils import is_hip
+
+            if self.ps.pp_size != 1:
+                raise ValueError(
+                    "DeepSeek-V4 HiSparse CSA prefetch currently requires PP=1."
+                )
+            if self.spec_algorithm.is_speculative():
+                raise ValueError(
+                    "DeepSeek-V4 HiSparse CSA prefetch is incompatible with "
+                    "speculative decoding."
+                )
+            if is_hip():
+                raise ValueError(
+                    "DeepSeek-V4 HiSparse CSA prefetch currently supports CUDA only."
+                )
+            graph_cfg = get_exec().graph.cuda_graph_config
+            if (
+                graph_cfg is not None
+                and graph_cfg[Phase.DECODE].backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "DeepSeek-V4 HiSparse CSA prefetch currently requires eager "
+                    "decode; pass --disable-decode-cuda-graph."
+                )
+
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -898,6 +927,12 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            dsv4_prefetch_mode=hisparse_cfg.dsv4_prefetch_mode,
+            dsv4_recall_interval=hisparse_cfg.dsv4_recall_interval,
+            dsv4_cpu_attention_backend=hisparse_cfg.dsv4_cpu_attention_backend,
+            dsv4_cpu_threads=hisparse_cfg.dsv4_cpu_threads,
+            dsv4_profile=hisparse_cfg.dsv4_profile,
+            dsv4_profile_log_interval=hisparse_cfg.dsv4_profile_log_interval,
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1703,6 +1738,9 @@ class ModelRunner:
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                self.hisparse_coordinator.begin_decode_step(
+                    num_real_reqs=forward_batch.batch_size
+                )
 
             # Replay cuda graph if applicable
             if can_run_graph:

@@ -202,7 +202,7 @@ def _sm120_sparse_decode_fwd(
     out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
     out[lonely.unsqueeze(-1).expand_as(out)] = 0.0
 
-    return out.to(torch.bfloat16), lse.permute(0, 2, 1)
+    return out.to(torch.bfloat16), lse_for_out.permute(0, 2, 1)
 
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).

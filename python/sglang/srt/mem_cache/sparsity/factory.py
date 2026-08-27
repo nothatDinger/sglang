@@ -63,8 +63,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
     host_to_device_ratio (2), swap_in_block_size (960).
-    Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
-    page_size. All remaining fields go to sparse_extra_config.
+    DeepSeek-V4 prefetch fields are parsed explicitly. All remaining fields go
+    to sparse_extra_config.
     """
     extra_config_str = server_args.hisparse_config
     if extra_config_str is not None:
@@ -98,6 +98,45 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
 
+    dsv4_prefetch_mode = extra_config.pop("dsv4_prefetch_mode", "cpu")
+    dsv4_recall_interval = extra_config.pop("dsv4_recall_interval", 8)
+    dsv4_cpu_attention_backend = extra_config.pop(
+        "dsv4_cpu_attention_backend", "auto"
+    )
+    dsv4_cpu_threads = extra_config.pop("dsv4_cpu_threads", 0)
+    dsv4_profile = extra_config.pop("dsv4_profile", False)
+    dsv4_profile_log_interval = extra_config.pop(
+        "dsv4_profile_log_interval", 100
+    )
+
+    if dsv4_prefetch_mode not in ("cpu", "h2d"):
+        raise ValueError(
+            "dsv4_prefetch_mode must be 'cpu' or 'h2d', got "
+            f"{dsv4_prefetch_mode!r}"
+        )
+    if (
+        not isinstance(dsv4_recall_interval, int)
+        or isinstance(dsv4_recall_interval, bool)
+    ):
+        raise ValueError("dsv4_recall_interval must be an integer")
+    if dsv4_cpu_attention_backend not in ("auto", "torch"):
+        raise ValueError(
+            "dsv4_cpu_attention_backend must be 'auto' or 'torch', got "
+            f"{dsv4_cpu_attention_backend!r}"
+        )
+    if not isinstance(dsv4_cpu_threads, int) or isinstance(dsv4_cpu_threads, bool):
+        raise ValueError("dsv4_cpu_threads must be an integer")
+    if dsv4_cpu_threads < 0:
+        raise ValueError("dsv4_cpu_threads must be non-negative")
+    if not isinstance(dsv4_profile, bool):
+        raise ValueError("dsv4_profile must be a boolean")
+    if (
+        not isinstance(dsv4_profile_log_interval, int)
+        or isinstance(dsv4_profile_log_interval, bool)
+        or dsv4_profile_log_interval <= 0
+    ):
+        raise ValueError("dsv4_profile_log_interval must be a positive integer")
+
     return SparseConfig(
         top_k=top_k,
         device_buffer_size=device_buffer_size,
@@ -107,6 +146,12 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        dsv4_prefetch_mode=dsv4_prefetch_mode,
+        dsv4_recall_interval=dsv4_recall_interval,
+        dsv4_cpu_attention_backend=dsv4_cpu_attention_backend,
+        dsv4_cpu_threads=dsv4_cpu_threads,
+        dsv4_profile=dsv4_profile,
+        dsv4_profile_log_interval=dsv4_profile_log_interval,
         sparse_extra_config=extra_config,
     )
 

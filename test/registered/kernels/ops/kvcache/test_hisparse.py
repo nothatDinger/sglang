@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    classify_cache_residency_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
@@ -267,6 +268,44 @@ def _long_case():
     # req 0 physical locs  : slot0->9, slot1->7, slot2->3, slot3->5
     # req 0 newest slot    : slot4/newest -> token 7 at physical loc 11
     return _make_state([[9, 7, 3, 5, 11]], [[1, 4, 2, 5, -1]], [7])
+
+
+def test_classify_cache_residency_splits_without_mutating_state() -> None:
+    state = _long_case()
+    tokens_before = state["device_buffer_tokens"].clone()
+    lru_before = state["lru_slots"].clone()
+    buffer_before = state["device_buffer"].clone()
+    top_k = torch.tensor([[4, 6, 7, -1]], dtype=torch.int32, device=DEVICE)
+    hit_locs = torch.full_like(top_k, -1)
+    miss_locs = torch.full(top_k.shape, -1, dtype=torch.int64, device=DEVICE)
+    miss_count = torch.zeros((1,), dtype=torch.int32, device=DEVICE)
+
+    classify_cache_residency_mla(
+        top_k_tokens=top_k,
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        hit_device_locs=hit_locs,
+        miss_host_locs=miss_locs,
+        miss_count=miss_count,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        block_size=256,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        hit_locs.cpu(), torch.tensor([[7, -1, 11, -1]], dtype=torch.int32)
+    )
+    assert torch.equal(
+        miss_locs.cpu(), torch.tensor([[-1, 6, -1, -1]], dtype=torch.int64)
+    )
+    assert miss_count.item() == 1
+    assert torch.equal(state["device_buffer_tokens"], tokens_before)
+    assert torch.equal(state["lru_slots"], lru_before)
+    assert torch.equal(state["device_buffer"], buffer_before)
 
 
 @pytest.mark.parametrize("seq_lens_dtype", [torch.int32, torch.int64])

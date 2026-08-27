@@ -212,6 +212,26 @@ def _jit_sparse_module(
 
 
 @functools.cache
+def _jit_classify_module(
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+) -> Module:
+    template_args = make_cpp_args(block_size, num_top_k, hot_buffer_size)
+    return load_jit(
+        "sparse_cache_classify",
+        *template_args,
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "classify_cache_residency",
+                f"classify_cache_residency<{template_args}>",
+            )
+        ],
+    )
+
+
+@functools.cache
 def _jit_copy_planned_module(
     block_size: int,
     is_mla: bool,
@@ -396,6 +416,51 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+    )
+
+
+def classify_cache_residency_mla(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    hit_device_locs: torch.Tensor,
+    miss_host_locs: torch.Tensor,
+    miss_count: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    hot_buffer_size: int,
+    num_real_reqs: torch.Tensor | None = None,
+    block_size: int = 256,
+) -> None:
+    """Split selected tokens into GPU hits and host misses without mutation.
+
+    The full swap kernel cannot be used as a no-copy classifier because it
+    still changes residency and LRU state. This operation leaves both intact.
+    """
+    num_top_k = top_k_tokens.size(1)
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
+        )
+    if hit_device_locs.dtype != torch.int32:
+        raise ValueError("hit_device_locs must be int32")
+    if miss_host_locs.dtype != torch.int64 or miss_count.dtype != torch.int32:
+        raise ValueError("miss_host_locs must be int64 and miss_count must be int32")
+
+    module = _jit_classify_module(block_size, num_top_k, hot_buffer_size)
+    module.classify_cache_residency(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        hit_device_locs,
+        miss_host_locs,
+        miss_count,
+        req_pool_indices,
+        seq_lens,
+        num_real_reqs,
     )
 
 
