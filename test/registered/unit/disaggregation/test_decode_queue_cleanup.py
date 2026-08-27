@@ -113,7 +113,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
-        scheduler.enable_hisparse = False
+        scheduler.enable_sparse_runtime = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -160,7 +160,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
-        scheduler.enable_hisparse = False
+        scheduler.enable_sparse_runtime = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -220,7 +220,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
-        scheduler.enable_hisparse = False
+        scheduler.enable_sparse_runtime = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -338,7 +338,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         scheduler = MagicMock()
         scheduler.enable_decode_hicache = False
-        scheduler.enable_hisparse = False
+        scheduler.enable_sparse_runtime = False
         scheduler.output_streamer = MagicMock()
         scheduler.metrics_reporter.enable_metrics = False
         queue.scheduler = scheduler
@@ -380,7 +380,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         scheduler.decode_offload_manager = None
-        scheduler.enable_hisparse = False
+        scheduler.enable_sparse_runtime = False
         scheduler.enable_hierarchical_cache = False
 
         self.assertFalse(scheduler.is_fully_idle())

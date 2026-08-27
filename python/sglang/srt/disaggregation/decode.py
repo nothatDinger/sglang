@@ -517,7 +517,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
-            if self.scheduler.enable_hisparse
+            if self.scheduler.enable_sparse_runtime
             else self.token_to_kv_pool
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -525,10 +525,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
-            if self.scheduler.enable_hisparse
+            if self.scheduler.enable_sparse_runtime
             else ["VRAM"] * len(kv_data_ptrs)
         )
-        if self.scheduler.enable_hisparse and isinstance(
+        if self.scheduler.enable_sparse_runtime and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
             device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
@@ -743,7 +743,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         # HiSparse admits up to the host-backed logical capacity.
-        if self.scheduler.enable_hisparse:
+        if self.scheduler.enable_sparse_runtime:
             capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
         else:
             capacity = self.max_total_num_tokens
@@ -1151,7 +1151,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
-        if self.scheduler.enable_hisparse:
+        if self.scheduler.enable_sparse_runtime:
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
@@ -1349,7 +1349,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
-            if self.scheduler.enable_hisparse:
+            if self.scheduler.enable_sparse_runtime:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
                 kv_transfer_page_size = getattr(
@@ -1470,7 +1470,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             device_page_indices = None
             if (
-                self.scheduler.enable_hisparse
+                self.scheduler.enable_sparse_runtime
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 and not _is_fake_transfer(decode_req.req)
             ):
@@ -1620,7 +1620,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 extra_reserved_reqs=extra_reserved_reqs
             )
 
-        if self.scheduler.enable_hisparse:
+        if self.scheduler.enable_sparse_runtime:
             logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
             if self._uses_swa_tail_prealloc() and hasattr(
                 logical_allocator, "full_available_size"
@@ -1806,7 +1806,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
-        if self.scheduler.enable_hisparse:
+        if self.scheduler.enable_sparse_runtime:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
@@ -1875,7 +1875,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
-        if self.scheduler.enable_hisparse:
+        if self.scheduler.enable_sparse_runtime:
             return host_indices
         return kv_loc
 
@@ -2293,7 +2293,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
+                if self.scheduler.enable_sparse_runtime:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 if (
                     self.enable_deferred_kv_release
@@ -2329,7 +2329,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                    if self.scheduler.enable_hisparse:
+                    if self.scheduler.enable_sparse_runtime:
                         self.scheduler.hisparse_coordinator.request_finished(
                             decode_req.req
                         )
@@ -2565,7 +2565,7 @@ class SchedulerDisaggregationDecodeMixin:
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
+                    if self.enable_sparse_runtime:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
@@ -2685,7 +2685,7 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            if self.enable_hisparse:
+            if self.enable_sparse_runtime:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)

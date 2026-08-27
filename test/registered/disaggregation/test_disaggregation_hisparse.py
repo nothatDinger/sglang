@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1000, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=3000, stage="extra-b", runner_config="8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LOADER_CONFIG = '{"enable_multithread_load": true, "num_threads": 64}'
@@ -35,10 +35,22 @@ def _has_nixl():
     return True
 
 
-class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
+class _DisaggregationDSV4SparseBase(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
+
+    dsv4_prefetch_mode = None
+    enable_legacy_hisparse = True
+
+    @classmethod
+    def sparse_config(cls):
+        if cls.dsv4_prefetch_mode is None:
+            return DSV4_HISPARSE_CONFIG
+        return (
+            DSV4_HISPARSE_CONFIG[:-1]
+            + f',"dsv4_prefetch_mode":"{cls.dsv4_prefetch_mode}"}}'
+        )
 
     @classmethod
     def setUpClass(cls):
@@ -80,6 +92,10 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             "--watchdog-timeout",
             "900",
         ]
+        if cls.dsv4_prefetch_mode is not None:
+            # Prefill warns and keeps its regular pool; decode activates.
+            prefill_args += ["--hisparse-config", cls.sparse_config()]
+
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -117,12 +133,13 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             "--model-loader-extra-config",
             DSV4_FLASH_LOADER_CONFIG,
             "--disable-decode-cuda-graph",
-            "--enable-hisparse",
-            "--hisparse-config",
-            DSV4_HISPARSE_CONFIG,
             "--watchdog-timeout",
             "900",
         ]
+        if cls.enable_legacy_hisparse:
+            decode_args.append("--enable-hisparse")
+        decode_args += ["--hisparse-config", cls.sparse_config()]
+
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -133,8 +150,22 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
         )
 
 
+class TestDisaggregationDSV4LegacyHiSparse(_DisaggregationDSV4SparseBase):
+    pass
+
+
+class TestDisaggregationDSV4ScoutAttention(_DisaggregationDSV4SparseBase):
+    dsv4_prefetch_mode = "scout"
+    enable_legacy_hisparse = False
+
+
+class TestDisaggregationDSV4InfiniGen(_DisaggregationDSV4SparseBase):
+    dsv4_prefetch_mode = "infinigen"
+    enable_legacy_hisparse = False
+
+
 @unittest.skipIf(is_in_ci(), "Flaky in CI — skip until stabilized.")
-class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
+class TestDisaggregationDSV4HiSparseNixl(_DisaggregationDSV4SparseBase):
     @classmethod
     def setUpClass(cls):
         PDDisaggregationServerBase.setUpClass.__func__(cls)

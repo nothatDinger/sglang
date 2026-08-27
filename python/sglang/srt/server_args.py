@@ -109,6 +109,13 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
+def _sparse_runtime_enabled(server_args: Any) -> bool:
+    from sglang.srt.mem_cache.sparsity.runtime import resolve_sparse_runtime_policy
+
+    return resolve_sparse_runtime_policy(server_args).enabled
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
@@ -2834,7 +2841,11 @@ class ServerArgs:
     hisparse_config: A[
         Optional[str],
         Arg(
-            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            help=(
+                "A JSON dictionary for sparse attention. On DeepSeek-V4, "
+                "explicitly setting dsv4_prefetch_mode to scout or infinigen "
+                "enables the runtime without --enable-hisparse."
+            ),
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
         NS("memory"),
@@ -7834,10 +7845,11 @@ class ServerArgs:
 
         # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
         # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
-        if self.enable_hisparse:
+        if _sparse_runtime_enabled(self):
             raise ValueError(
-                "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
-                "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+                "--prefill-only-disable-kv-cache is incompatible with the "
+                "HiSparse/ScoutAttention/InfiniGen sparse runtime, which uses "
+                "a dedicated pool family rather than the no-op MHA pool."
             )
 
     def _handle_prefill_only_disable_kv_cache(self):
@@ -7981,11 +7993,6 @@ class ServerArgs:
             raise NotImplementedError(
                 "--enable-lmcache with --dcp-size > 1 is not supported: "
                 "LMCache has no DCP-aware index translation."
-            )
-        if self.enable_hisparse:
-            raise NotImplementedError(
-                "--enable-hisparse with --dcp-size > 1 is not supported: the "
-                "HiSparse host pool is constructed without DCP translation."
             )
         if not self.use_mla_backend():
             raise NotImplementedError(
@@ -8919,9 +8926,9 @@ class ServerArgs:
                 "--enable-unified-memory with PD disaggregation requires lazy "
                 "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
             )
-            assert not self.enable_hisparse, (
+            assert not _sparse_runtime_enabled(self), (
                 "--enable-unified-memory with PD disaggregation is not compatible "
-                "with --enable-hisparse: the decode-side HiSparse prealloc path "
+                "with the sparse runtime: its decode-side preallocation path "
                 "ships host/C4 rows straight from the allocator, bypassing the "
                 "virtual->physical translation the unified pool needs."
             )

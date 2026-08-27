@@ -258,10 +258,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
     ) -> NPUDeepSeekV4SingleKVPool:
-        # NPU does not use the HiSparse c4 device pool; fail loud if someone
-        # enables it so the silent layout mismatch surfaces at init.
+        # NPU does not use the host-backed C4 device pool; fail loudly so a
+        # sparse-runtime layout mismatch surfaces at initialization.
         assert cls is DeepSeekV4SingleKVPool, (
-            "enable_hisparse is not supported on the NPU DSV4 KV pool "
+            "The DeepSeek-V4 sparse runtime is not supported on the NPU KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
         # Full/SWA use the global page size, C4 uses its native compressed page,

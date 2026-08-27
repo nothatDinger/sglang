@@ -80,7 +80,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s._abort_on_running_timeout = MagicMock()
     s.dllm_config = None
     s.dllm_manager = None
-    s.enable_hisparse = False
+    s.enable_sparse_runtime = False
     s.enable_fpm = False
     s.last_batch = None
     s.require_mlp_sync = False

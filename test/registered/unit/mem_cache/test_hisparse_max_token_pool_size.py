@@ -2,7 +2,7 @@
 
 Covers the HiSparse host-backed capacity fix:
 - `ModelRunner.max_token_pool_size` returns the allocator's `size_full` when
-  `enable_hisparse` is set (host-backed logical pool), otherwise it delegates
+  `enable_sparse_runtime` is set (host-backed logical pool), otherwise it delegates
   to `effective_max_total_num_tokens`.
 - `DecodePreallocQueue._check_if_req_exceed_kv_capacity` uses that ratio-expanded
   capacity for admission when HiSparse is enabled, so long-context inputs are
@@ -39,7 +39,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
         host-backed logical capacity (device_pool * host_to_device_ratio) wins
         over `effective_max_total_num_tokens`."""
         instance = _make_model_runner(
-            enable_hisparse=True,
+            enable_sparse_runtime=True,
             token_to_kv_pool_allocator=SimpleNamespace(size_full=4096),
             is_hybrid_swa=False,
             max_total_num_tokens=1024,
@@ -53,7 +53,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
         (e.g. non-HiSparse allocator wired at init time). Fall back to the
         SWA-aware effective capacity so we never crash on `AttributeError`."""
         instance = _make_model_runner(
-            enable_hisparse=True,
+            enable_sparse_runtime=True,
             token_to_kv_pool_allocator=SimpleNamespace(),  # no size_full
             is_hybrid_swa=False,
             max_total_num_tokens=2048,
@@ -67,7 +67,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
         `effective_max_total_num_tokens` (which returns `max_total_num_tokens`
         when SWA is not hybrid)."""
         instance = _make_model_runner(
-            enable_hisparse=False,
+            enable_sparse_runtime=False,
             token_to_kv_pool_allocator=SimpleNamespace(size_full=99999),  # ignored
             is_hybrid_swa=False,
             max_total_num_tokens=1024,
@@ -78,7 +78,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
 
     def test_non_hisparse_hybrid_swa_prefers_full_max(self):
         instance = _make_model_runner(
-            enable_hisparse=False,
+            enable_sparse_runtime=False,
             token_to_kv_pool_allocator=SimpleNamespace(),
             is_hybrid_swa=True,
             max_total_num_tokens=1024,
@@ -91,7 +91,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
 
 def _make_prealloc_queue(
     *,
-    enable_hisparse: bool,
+    enable_sparse_runtime: bool,
     max_token_pool_size: int,
     max_total_num_tokens: int,
 ):
@@ -105,7 +105,7 @@ def _make_prealloc_queue(
     model_runner = SimpleNamespace(max_token_pool_size=max_token_pool_size)
     tp_worker = SimpleNamespace(model_runner=model_runner)
     queue.scheduler = SimpleNamespace(
-        enable_hisparse=enable_hisparse,
+        enable_sparse_runtime=enable_sparse_runtime,
         tp_worker=tp_worker,
         output_streamer=MagicMock(),
     )
@@ -129,7 +129,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         `max_total_num_tokens` but within HiSparse host-backed
         `max_token_pool_size` must NOT be aborted."""
         queue = _make_prealloc_queue(
-            enable_hisparse=True,
+            enable_sparse_runtime=True,
             max_token_pool_size=4096,  # host-backed logical capacity
             max_total_num_tokens=1024,  # device pool
         )
@@ -141,7 +141,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
     def test_hisparse_rejects_beyond_host_backed_size(self):
         """Requests longer than host-backed capacity are still aborted."""
         queue = _make_prealloc_queue(
-            enable_hisparse=True,
+            enable_sparse_runtime=True,
             max_token_pool_size=4096,
             max_total_num_tokens=1024,
         )
@@ -158,7 +158,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         """Non-HiSparse path must keep using `max_total_num_tokens` — the
         HiSparse branch must not bleed into normal decode admission."""
         queue = _make_prealloc_queue(
-            enable_hisparse=False,
+            enable_sparse_runtime=False,
             max_token_pool_size=4096,  # ignored on non-HiSparse
             max_total_num_tokens=1024,
         )
@@ -174,7 +174,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         admission gate must use the rebootstrap-aware length (prompt + output)
         rather than just the prompt length."""
         queue = _make_prealloc_queue(
-            enable_hisparse=True,
+            enable_sparse_runtime=True,
             max_token_pool_size=100,
             max_total_num_tokens=100,
         )

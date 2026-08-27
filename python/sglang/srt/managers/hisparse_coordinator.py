@@ -26,6 +26,10 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.sparsity.runtime import (
+    DSV4_PREFETCH_MODE_INFINIGEN,
+    DSV4_PREFETCH_MODE_SCOUT,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
@@ -127,7 +131,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
-        dsv4_prefetch_mode: str = "cpu",
+        dsv4_prefetch_mode: str = DSV4_PREFETCH_MODE_SCOUT,
         dsv4_recall_interval: int = 8,
         dsv4_cpu_attention_backend: str = "auto",
         dsv4_cpu_threads: int = 0,
@@ -414,7 +418,7 @@ class HiSparseCoordinator:
         self.dsv4_miss_count: Optional[torch.Tensor] = None
         self._dsv4_cpu_miss_locs: List[torch.Tensor] = []
         self._dsv4_periodic_miss_count_cpu: List[torch.Tensor] = []
-        if self.dsv4_prefetch_mode == "cpu":
+        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
             self.dsv4_miss_host_locs = torch.full(
                 shape, -1, dtype=torch.int64, device=self.device
             )
@@ -447,7 +451,7 @@ class HiSparseCoordinator:
         ] = {}
         self._dsv4_active_cpu_layers: Dict[int, int] = {}
 
-        if self.dsv4_prefetch_mode == "cpu":
+        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
             if self.dsv4_cpu_threads > 0:
                 torch.set_num_threads(self.dsv4_cpu_threads)
             self._dsv4_cpu_executor = ThreadPoolExecutor(
@@ -459,7 +463,7 @@ class HiSparseCoordinator:
                 else "unknown"
             )
             logger.info(
-                "DeepSeek-V4 HiSparse CSA prefetch enabled: mode=cpu, "
+                "DeepSeek-V4 ScoutAttention enabled, "
                 "recall_interval=%d, cpu_backend=%s, cpu_capability=%s, "
                 "torch_threads=%d",
                 self.dsv4_recall_interval,
@@ -469,7 +473,7 @@ class HiSparseCoordinator:
             )
         else:
             logger.info(
-                "DeepSeek-V4 HiSparse CSA prefetch enabled: mode=h2d."
+                "DeepSeek-V4 InfiniGen enabled."
             )
 
     def register_dsv4_csa_layers(self, layers) -> None:
@@ -490,7 +494,7 @@ class HiSparseCoordinator:
         csa_layers = sorted(self._dsv4_registered_layers)
         self._dsv4_next_csa_layer = dict(zip(csa_layers, csa_layers[1:]))
         logger.info(
-            "DeepSeek-V4 HiSparse registered CSA layers=%s; next-CSA prefetch "
+            "DeepSeek-V4 sparse runtime registered CSA layers=%s; next-CSA prefetch "
             "uses each source CSA layer's normalized input hidden state.",
             csa_layers,
         )
@@ -500,14 +504,14 @@ class HiSparseCoordinator:
             return
         if num_real_reqs < 0:
             raise ValueError(
-                "DeepSeek-V4 HiSparse real request count must be non-negative, "
+                "DeepSeek-V4 sparse runtime real request count must be non-negative, "
                 f"got {num_real_reqs}."
             )
         self._dsv4_num_real_reqs_cpu = int(num_real_reqs)
         self._dsv4_decode_step += 1
         self._dsv4_prediction_allowed = None
         self._dsv4_periodic_due = (
-            self.dsv4_prefetch_mode == "cpu"
+            self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT
             and self.dsv4_recall_interval > 0
             and self._dsv4_decode_step % self.dsv4_recall_interval == 0
         )
@@ -558,13 +562,13 @@ class HiSparseCoordinator:
         if self._dsv4_prediction_allowed is None:
             if seq_lens_cpu is None:
                 raise RuntimeError(
-                    "DeepSeek-V4 HiSparse CSA prefetch requires the decode "
+                    "DeepSeek-V4 sparse runtime CSA prefetch requires the decode "
                     "seq_lens_cpu mirror."
                 )
             num_real_reqs = self._dsv4_num_real_reqs_cpu
             if num_real_reqs > len(seq_lens_cpu):
                 raise RuntimeError(
-                    "DeepSeek-V4 HiSparse real request count exceeds the "
+                    "DeepSeek-V4 sparse runtime real request count exceeds the "
                     "padded sequence-length buffer: "
                     f"real={num_real_reqs}, padded={len(seq_lens_cpu)}."
                 )
@@ -582,7 +586,7 @@ class HiSparseCoordinator:
         compressed_layer = self._dsv4_compressed_layer_id(target_layer_id)
         if self._dsv4_ready[compressed_layer]:
             raise RuntimeError(
-                "DeepSeek-V4 HiSparse predicted index was not consumed before "
+                "DeepSeek-V4 sparse runtime predicted index was not consumed before "
                 f"the next decode step (layer={target_layer_id})."
             )
 
@@ -626,7 +630,7 @@ class HiSparseCoordinator:
         num_real_reqs = self._dsv4_num_real_reqs_cpu
         if num_real_reqs > num_reqs:
             raise RuntimeError(
-                "DeepSeek-V4 HiSparse real request count exceeds the padded "
+                "DeepSeek-V4 sparse runtime real request count exceeds the padded "
                 f"selection batch: real={num_real_reqs}, padded={num_reqs}."
             )
         self.dsv4_predicted_raw_indices[compressed_layer, :num_reqs].copy_(
@@ -663,7 +667,7 @@ class HiSparseCoordinator:
         if num_real_reqs_cpu < num_reqs:
             output[num_real_reqs_cpu:].fill_(-1)
 
-        if self.dsv4_prefetch_mode == "h2d":
+        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_INFINIGEN:
             return self._run_swap_in_kernel(
                 req_indices,
                 seq_lens,
@@ -714,7 +718,7 @@ class HiSparseCoordinator:
             top_k_result=top_k_result,
         )
         with torch.profiler.record_function(
-            f"dsv4_hisparse/prefetch_{self.dsv4_prefetch_mode}/"
+            f"dsv4_sparse/{self.dsv4_prefetch_mode}/"
             f"layer_{physical_layer_id}"
         ):
             self._run_dsv4_selection(
@@ -747,7 +751,7 @@ class HiSparseCoordinator:
             compressed_layer=compressed_layer,
             num_reqs=num_reqs,
         )
-        if self.dsv4_prefetch_mode == "cpu":
+        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
             self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
         return result
 
@@ -798,7 +802,7 @@ class HiSparseCoordinator:
             )
 
         self._dsv4_ready[compressed_layer] = False
-        if self.dsv4_prefetch_mode == "cpu":
+        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
             self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
         return self.dsv4_predicted_device_locs[
             compressed_layer, :num_reqs
@@ -813,7 +817,10 @@ class HiSparseCoordinator:
         head_dim_v: int,
     ) -> bool:
         compressed_layer = self._dsv4_active_cpu_layers.get(physical_layer_id)
-        if compressed_layer is None or self.dsv4_prefetch_mode != "cpu":
+        if (
+            compressed_layer is None
+            or self.dsv4_prefetch_mode != DSV4_PREFETCH_MODE_SCOUT
+        ):
             return False
         if physical_layer_id in self._dsv4_cpu_jobs:
             raise RuntimeError(
@@ -830,7 +837,7 @@ class HiSparseCoordinator:
         num_real_reqs = self._dsv4_batch_num_reqs_cpu[compressed_layer]
         if num_real_reqs > num_reqs:
             raise RuntimeError(
-                "DeepSeek-V4 HiSparse real request count exceeds the CPU "
+                "DeepSeek-V4 sparse runtime real request count exceeds the CPU "
                 f"attention batch: real={num_real_reqs}, padded={num_reqs}."
             )
         assert self.dsv4_miss_host_locs is not None
@@ -983,7 +990,7 @@ class HiSparseCoordinator:
     ) -> None:
         if not self._dsv4_periodic_due:
             return
-        assert self.dsv4_prefetch_mode == "cpu"
+        assert self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT
         if self._dsv4_periodic_pending[compressed_layer]:
             raise RuntimeError(
                 "DeepSeek-V4 periodic recall from the previous interval is "
@@ -1126,7 +1133,7 @@ class HiSparseCoordinator:
             float(recall_bytes),
         )
         logger.info(
-            "DeepSeek-V4 HiSparse periodic KV recall step=%d layer=%d "
+            "DeepSeek-V4 sparse runtime periodic KV recall step=%d layer=%d "
             "num_reqs=%d periodic_kv_recall_miss_tokens=%d "
             "kv_miss_per_req_mean=%.3f kv_miss_per_req_p50=%d "
             "kv_miss_per_req_p95=%d kv_miss_per_req_max=%d "
@@ -1163,7 +1170,7 @@ class HiSparseCoordinator:
             minimum = min(layer_misses)
             maximum = max(layer_misses)
             logger.info(
-                "DeepSeek-V4 HiSparse periodic KV recall layer comparison "
+                "DeepSeek-V4 sparse runtime periodic KV recall layer comparison "
                 "step=%d kv_recall_miss_tokens_by_layer=%s min=%d max=%d "
                 "mean=%.3f spread=%d",
                 step,
@@ -1237,7 +1244,7 @@ class HiSparseCoordinator:
                     else 1.0
                 )
             logger.info(
-                "DeepSeek-V4 HiSparse profile step=%d layer=%d %s",
+                "DeepSeek-V4 sparse runtime profile step=%d layer=%d %s",
                 self._dsv4_decode_step,
                 layer_id,
                 summary,

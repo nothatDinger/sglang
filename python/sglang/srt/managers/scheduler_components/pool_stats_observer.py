@@ -147,7 +147,7 @@ class SchedulerPoolStatsObserver:
     hisparse_coordinator: Any
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
-    enable_hisparse: bool
+    enable_sparse_runtime: bool
     full_tokens_per_layer: Any
     swa_tokens_per_layer: Any
     max_total_num_tokens: int
@@ -199,7 +199,7 @@ class SchedulerPoolStatsObserver:
         else:
             pool_stats = self._get_token_info()
 
-        if self.enable_hisparse:
+        if self.enable_sparse_runtime:
             pool_stats = self._get_hisparse_token_info(pool_stats)
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
@@ -226,7 +226,7 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
-        if self.enable_hisparse and self.hisparse_coordinator is not None:
+        if self.enable_sparse_runtime and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
             return dataclasses.replace(
                 pool_stats,
@@ -298,7 +298,7 @@ class SchedulerPoolStatsObserver:
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
         # bug should be fixed so the clamp can go away.
-        if self.enable_hisparse:
+        if self.enable_sparse_runtime:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
         if not self.full_tokens_per_layer:

@@ -280,6 +280,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.sparsity.runtime import resolve_sparse_runtime_policy
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -462,7 +463,8 @@ class Scheduler(
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        self.enable_hisparse = get_memory().enable_hisparse
+        self.sparse_runtime_policy = resolve_sparse_runtime_policy(server_args)
+        self.enable_sparse_runtime = self.sparse_runtime_policy.enabled
         self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
 
@@ -1144,7 +1146,7 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
-        if not self.enable_hisparse:
+        if not self.enable_sparse_runtime:
             return
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
@@ -2110,7 +2112,7 @@ class Scheduler(
             hisparse_coordinator=self.hisparse_coordinator,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
-            enable_hisparse=self.enable_hisparse,
+            enable_sparse_runtime=self.enable_sparse_runtime,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens
@@ -3134,7 +3136,7 @@ class Scheduler(
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        if self.enable_sparse_runtime:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -3147,7 +3149,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not self.enable_sparse_runtime
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
@@ -4188,7 +4190,7 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
-        if not self.enable_hisparse and not deferred_pending:
+        if not self.enable_sparse_runtime and not deferred_pending:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
@@ -4257,7 +4259,7 @@ class Scheduler(
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
+            if self.enable_sparse_runtime:
                 idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before

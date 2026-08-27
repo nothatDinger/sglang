@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.sparsity.runtime import resolve_sparse_runtime_policy
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
@@ -376,7 +377,8 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        self.sparse_runtime_policy = resolve_sparse_runtime_policy(server_args)
+        self.enable_sparse_runtime = self.sparse_runtime_policy.enabled
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
@@ -450,7 +452,8 @@ class ModelRunner:
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
-        # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+        # Set before initialize() so CUDA graph capture can see the shared
+        # sparse-runtime coordinator.
         self.hisparse_coordinator = None
 
         # The native overlap path replaces this during load_model(). Keep the
@@ -869,7 +872,7 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_hisparse:
+        if not self.enable_sparse_runtime:
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
@@ -881,20 +884,21 @@ class ModelRunner:
         if is_deepseek_v4(self.model_config.hf_text_config):
             from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
             from sglang.srt.runtime_context import get_exec
-            from sglang.srt.utils import is_hip
+            from sglang.srt.utils import is_cuda
 
             if self.ps.pp_size != 1:
                 raise ValueError(
-                    "DeepSeek-V4 HiSparse CSA prefetch currently requires PP=1."
+                    "DeepSeek-V4 sparse runtime CSA prefetch currently requires PP=1."
                 )
             if self.spec_algorithm.is_speculative():
                 raise ValueError(
-                    "DeepSeek-V4 HiSparse CSA prefetch is incompatible with "
+                    "DeepSeek-V4 sparse runtime CSA prefetch is incompatible with "
                     "speculative decoding."
                 )
-            if is_hip():
+            if not is_cuda():
                 raise ValueError(
-                    "DeepSeek-V4 HiSparse CSA prefetch currently supports CUDA only."
+                    "DeepSeek-V4 sparse runtime CSA prefetch currently supports "
+                    "CUDA only."
                 )
             graph_cfg = get_exec().graph.cuda_graph_config
             if (
@@ -902,7 +906,7 @@ class ModelRunner:
                 and graph_cfg[Phase.DECODE].backend != Backend.DISABLED
             ):
                 raise ValueError(
-                    "DeepSeek-V4 HiSparse CSA prefetch currently requires eager "
+                    "DeepSeek-V4 sparse runtime CSA prefetch currently requires eager "
                     "decode; pass --disable-decode-cuda-graph."
                 )
 
@@ -1342,8 +1346,8 @@ class ModelRunner:
 
     @property
     def max_token_pool_size(self):
-        """Return the max token pool size considering hybrid swa and hisparse settings."""
-        if self.enable_hisparse:
+        """Return the token capacity for hybrid SWA and sparse runtimes."""
+        if self.enable_sparse_runtime:
             # HiSparse uses the host-backed full pool capacity.
             size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
             if size_full is not None:
