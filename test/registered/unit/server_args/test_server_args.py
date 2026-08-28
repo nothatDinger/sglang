@@ -638,23 +638,10 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertIn(
             "--disaggregation-decode-enable-radix-cache is incompatible with "
-            "the HiSparse/ScoutAttention/InfiniGen sparse runtime",
+            "--enable-hisparse",
             str(context.exception),
         )
 
-    def test_pd_decode_radix_cache_rejects_standalone_dsv4_mode(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_decode_enable_radix_cache=True,
-            disaggregation_transfer_backend="nixl",
-            hisparse_config='{"dsv4_prefetch_mode":"scout"}',
-        )
-
-        with self.assertRaisesRegex(
-            ValueError, "ScoutAttention/InfiniGen sparse runtime"
-        ):
-            server_args._handle_pd_disaggregation()
     def test_pd_decode_radix_cache_rejects_fake_backend(self):
         server_args = ServerArgs(
             model_path="dummy",

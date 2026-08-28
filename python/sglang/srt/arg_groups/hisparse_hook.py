@@ -78,15 +78,8 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
-    """Validate the legacy HiSparse flag and the unified DSV4 sparse runtime."""
-    from sglang.srt.mem_cache.sparsity.runtime import (
-        log_sparse_runtime_policy_warnings,
-        resolve_sparse_runtime_policy,
-    )
-
-    policy = resolve_sparse_runtime_policy(server_args)
-    log_sparse_runtime_policy_warnings(policy)
-    if not policy.enabled and not policy.dsv4_prefetch_mode_explicit:
+    """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
+    if not server_args.enable_hisparse:
         return
 
     from sglang.srt.configs.model_config import (
@@ -95,54 +88,36 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     hf_config = server_args.get_model_config().hf_config
-    is_v4_sparse_runtime = is_deepseek_v4(hf_config)
-    is_dsa_hisparse = is_deepseek_dsa(hf_config)
-    if policy.dsv4_prefetch_mode_explicit and not is_v4_sparse_runtime:
-        raise ValueError(
-            "An explicit dsv4_prefetch_mode enables ScoutAttention/InfiniGen "
-            "and is only supported for DeepSeek-V4 models."
-        )
-    if not policy.enabled:
-        return
-
+    is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = _is_hip()
-
-    if policy.legacy_hisparse_enabled:
-        assert is_dsa_hisparse or is_v4_sparse_runtime, (
-            "--enable-hisparse is only supported for DSA (DeepSeek Sparse "
-            "Attention) models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4."
-        )
-
-    assert server_args.disable_radix_cache, (
-        "The HiSparse/ScoutAttention/InfiniGen sparse runtime currently "
-        "requires --disable-radix-cache."
+    assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
+        "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
+        "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    if getattr(server_args, "dcp_size", 1) > 1:
-        raise NotImplementedError(
-            "The HiSparse/ScoutAttention/InfiniGen sparse runtime with "
-            "--dcp-size > 1 is not supported: the host pool has no DCP "
-            "index translation."
+    assert (
+        server_args.disable_radix_cache
+    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+
+    # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
+    # aware checks below only apply to the DSA hisparse path.
+    if is_hip and is_v4_hisparse:
+        # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
+        # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
+        # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
+        # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
         )
 
-    # DeepSeek-V4 handles its own dtype/backend pairing. The checks below only
-    # apply to the legacy DSA HiSparse path.
-    if is_v4_sparse_runtime:
-        if is_hip:
-            # TEMPORARY GUARD: the DSV4 host-backed runtime is not supported on
-            # the unified-KV path because it requires the separate packed C4 pool.
-            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-                is_unified_kv_triton,
+        if is_unified_kv_triton():
+            raise ValueError(
+                "--enable-hisparse is not supported with the unified-KV path on ROCm"
+                "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton) for DeepSeek-V4: "
+                "HiSparse currently requires the separate packed KV layout. "
+                "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
+                "--enable-hisparse."
             )
-
-            if is_unified_kv_triton():
-                raise ValueError(
-                    "The DeepSeek-V4 HiSparse/ScoutAttention/InfiniGen runtime "
-                    "is not supported with the unified-KV path on ROCm "
-                    "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton). Set "
-                    "SGLANG_HACK_FLASHMLA_BACKEND=triton or disable the sparse "
-                    "runtime."
-                )
         return
 
     from sglang.srt.arg_groups.overrides import resolved_view

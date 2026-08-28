@@ -668,32 +668,6 @@ class C4IndexerBackendMixin:
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
-        dsv4_prediction = (
-            hisparse_decode
-            and hisparse_coordinator.is_dsv4_prediction(c4_indexer.layer_id)
-        )
-        if hisparse_decode and not dsv4_prediction:
-            prefetched_indices = hisparse_coordinator.try_consume_dsv4_prefetch(
-                physical_layer_id=c4_indexer.layer_id,
-                num_reqs=num_queries,
-            )
-            if prefetched_indices is not None:
-                # The target layer still writes its real index K from its own
-                # input. Only its query/top-k computation is replaced by the
-                # previous CSA input prediction.
-                self.forward_indexer_compressor(
-                    x=x,
-                    forward_batch=forward_batch,
-                    layer_id=c4_indexer.layer_id,
-                    compressor=c4_indexer.compressor,
-                )
-                core_metadata.c4_sparse_page_indices = prefetched_indices
-                return
-
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
@@ -764,26 +738,11 @@ class C4IndexerBackendMixin:
             return F.pad(tensor, pad, value=value)
 
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
-        if dsv4_prediction:
-            # The target CSA compressor has not run yet. Exclude the C4 token
-            # produced by this decode step at compression boundaries; it is
-            # already covered by SWA and reading its target-layer index K here
-            # would consume an unwritten cache row.
-            active_compression = (
-                forward_batch.seq_lens[:query_rows].remainder(4) == 0
-            )
-            c4_seq_lens = (c4_seq_lens - active_compression).clamp(min=1)
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
         c4_sparse_page_indices = match_num_queries(
             core_metadata.c4_sparse_page_indices, value=-1
         )
-        if dsv4_prediction:
-            _, c4_sparse_page_indices = (
-                hisparse_coordinator.dsv4_prediction_buffers(
-                    c4_indexer.layer_id, query_rows
-                )
-            )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
@@ -834,12 +793,13 @@ class C4IndexerBackendMixin:
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
+        hisparse_coordinator = self.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        )
+
         raw_indices = None
-        if dsv4_prediction:
-            raw_indices, _ = hisparse_coordinator.dsv4_prediction_buffers(
-                c4_indexer.layer_id, c4_sparse_page_indices.size(0)
-            )
-        elif capture_enabled:
+        if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
@@ -884,22 +844,17 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        if dsv4_prediction:
-            hisparse_coordinator.complete_dsv4_prediction(
-                physical_layer_id=c4_indexer.layer_id,
-                req_pool_indices=forward_batch.req_pool_indices,
-                compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                top_k_result=raw_indices,
-            )
-            return
         if hisparse_coordinator is not None:
             if hisparse_decode:
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
                 core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.process_dsv4_current_index(
-                        physical_layer_id=c4_indexer.layer_id,
+                    hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,
+                        layer_id=compress_layer_id,
                     )
                 )
             else:

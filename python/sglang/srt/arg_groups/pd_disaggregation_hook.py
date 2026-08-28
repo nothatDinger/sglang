@@ -14,12 +14,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _sparse_runtime_enabled(server_args: ServerArgs) -> bool:
-    from sglang.srt.mem_cache.sparsity.runtime import resolve_sparse_runtime_policy
-
-    return resolve_sparse_runtime_policy(server_args).enabled
-
-
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -75,10 +69,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
-            if _sparse_runtime_enabled(server_args):
+            if server_args.enable_hisparse:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with the HiSparse/ScoutAttention/InfiniGen sparse runtime"
+                    "with --enable-hisparse"
                 )
             if server_args.disaggregation_transfer_backend == "fake":
                 raise ValueError(

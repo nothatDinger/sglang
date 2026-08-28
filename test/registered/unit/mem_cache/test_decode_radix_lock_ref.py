@@ -421,7 +421,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler = MagicMock()
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args
-        scheduler.enable_sparse_runtime = False
+        scheduler.enable_hisparse = False
         scheduler.enable_decode_hicache = False
         scheduler.enable_priority_scheduling = False
         scheduler.waiting_queue = []

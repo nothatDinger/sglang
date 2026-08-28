@@ -755,7 +755,7 @@ class TestHiSparseUnit(unittest.TestCase):
             protected_size=lambda: 0,
         )
         queue.scheduler = SimpleNamespace(
-            enable_sparse_runtime=True,
+            enable_hisparse=True,
             hisparse_coordinator=self.coordinator,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )

@@ -30,7 +30,6 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    is_deepseek_v4,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -91,7 +90,6 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.sparsity.runtime import resolve_sparse_runtime_policy
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
@@ -377,8 +375,7 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.sparse_runtime_policy = resolve_sparse_runtime_policy(server_args)
-        self.enable_sparse_runtime = self.sparse_runtime_policy.enabled
+        self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
@@ -452,8 +449,7 @@ class ModelRunner:
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
-        # Set before initialize() so CUDA graph capture can see the shared
-        # sparse-runtime coordinator.
+        # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
         # The native overlap path replaces this during load_model(). Keep the
@@ -872,7 +868,7 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_sparse_runtime:
+        if not self.enable_hisparse:
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
@@ -881,35 +877,6 @@ class ModelRunner:
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
-        if is_deepseek_v4(self.model_config.hf_text_config):
-            from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-            from sglang.srt.runtime_context import get_exec
-            from sglang.srt.utils import is_cuda
-
-            if self.ps.pp_size != 1:
-                raise ValueError(
-                    "DeepSeek-V4 sparse runtime CSA prefetch currently requires PP=1."
-                )
-            if self.spec_algorithm.is_speculative():
-                raise ValueError(
-                    "DeepSeek-V4 sparse runtime CSA prefetch is incompatible with "
-                    "speculative decoding."
-                )
-            if not is_cuda():
-                raise ValueError(
-                    "DeepSeek-V4 sparse runtime CSA prefetch currently supports "
-                    "CUDA only."
-                )
-            graph_cfg = get_exec().graph.cuda_graph_config
-            if (
-                graph_cfg is not None
-                and graph_cfg[Phase.DECODE].backend != Backend.DISABLED
-            ):
-                raise ValueError(
-                    "DeepSeek-V4 sparse runtime CSA prefetch currently requires eager "
-                    "decode; pass --disable-decode-cuda-graph."
-                )
-
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -931,12 +898,6 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
-            dsv4_prefetch_mode=hisparse_cfg.dsv4_prefetch_mode,
-            dsv4_recall_interval=hisparse_cfg.dsv4_recall_interval,
-            dsv4_cpu_attention_backend=hisparse_cfg.dsv4_cpu_attention_backend,
-            dsv4_cpu_threads=hisparse_cfg.dsv4_cpu_threads,
-            dsv4_profile=hisparse_cfg.dsv4_profile,
-            dsv4_profile_log_interval=hisparse_cfg.dsv4_profile_log_interval,
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1346,8 +1307,8 @@ class ModelRunner:
 
     @property
     def max_token_pool_size(self):
-        """Return the token capacity for hybrid SWA and sparse runtimes."""
-        if self.enable_sparse_runtime:
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
             # HiSparse uses the host-backed full pool capacity.
             size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
             if size_full is not None:
@@ -1742,9 +1703,6 @@ class ModelRunner:
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-                self.hisparse_coordinator.begin_decode_step(
-                    num_real_reqs=forward_batch.batch_size
-                )
 
             # Replay cuda graph if applicable
             if can_run_graph:

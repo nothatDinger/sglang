@@ -152,7 +152,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
-        scheduler.enable_sparse_runtime = False
+        scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()

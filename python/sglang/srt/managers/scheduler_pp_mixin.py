@@ -1497,7 +1497,7 @@ class SchedulerPPMixin:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
-            if self.enable_sparse_runtime:
+            if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)

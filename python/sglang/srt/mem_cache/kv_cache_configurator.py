@@ -62,10 +62,6 @@ from sglang.srt.mem_cache.memory_pool import (
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.sparsity.runtime import (
-    SparseRuntimePolicy,
-    resolve_sparse_runtime_policy,
-)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -244,10 +240,8 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
-    sparse_runtime_policy: SparseRuntimePolicy = field(init=False)
 
     def __post_init__(self) -> None:
-        self.sparse_runtime_policy = resolve_sparse_runtime_policy(self.server_args)
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         # Each multi-layer EAGLE MTP head owns one transformer block at
@@ -1141,7 +1135,7 @@ class KVCacheConfigurator:
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_sparse_runtime=self.sparse_runtime_policy.enabled,
+            enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
         return token_to_kv_pool
@@ -1789,10 +1783,8 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if self.sparse_runtime_policy.enabled and is_dsv4_model:
-                assert self.is_hybrid_swa, (
-                    "DeepSeek V4 sparse runtime requires SWA mode."
-                )
+            if get_memory().enable_hisparse and is_dsv4_model:
+                assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
                 )

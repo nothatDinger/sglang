@@ -195,7 +195,7 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
         hisparse_coordinator=None,
         is_hybrid_swa=False,
         is_hybrid_ssm=True,
-        enable_sparse_runtime=False,
+        enable_hisparse=False,
         full_tokens_per_layer=None,
         swa_tokens_per_layer=None,
         max_total_num_tokens=42,

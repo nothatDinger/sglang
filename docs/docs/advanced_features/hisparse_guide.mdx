@@ -1,17 +1,12 @@
 ---
 title: "HiSparse: Hierarchical Sparse Attention"
 metatags:
-    description: "Use HiSparse, ScoutAttention, and InfiniGen to reduce decode GPU KV memory with CPU pinned host storage in regular or PD serving."
+    description: "Use HiSparse hierarchical sparse attention to reduce decode GPU KV memory with CPU pinned host storage and PD disaggregation."
 ---
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: The legacy `--enable-hisparse` path supports
-> **DeepSeek Sparse Attention (DSA)** models (for example DeepSeek-V3.2 and
-> GLM-5.1) and **DeepSeek V4**. DeepSeek V4 can also enable the same host-backed
-> runtime without the legacy flag by explicitly setting
-> `dsv4_prefetch_mode` to `scout` or `infinigen`; this works in a regular
-> server as well as on a PD decode server.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
 
 ## Why HiSparse?
 
@@ -123,87 +118,6 @@ Pass as a JSON string via `--hisparse-config`:
 
 Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
 
-### DeepSeek V4 CSA look-ahead prefetch
-
-DeepSeek V4 alternates C4 compressed sparse-attention (CSA) layers with HCA
-layers. HiSparse discovers the ordered C4 layers from the loaded model instead
-of assuming a fixed layer distance. At a source CSA layer it uses that layer's
-**input after input normalization** as the input to the next CSA layer's
-<code>wq_a</code>, indexer query projection, and indexer weight projection.
-The resulting top-k is therefore ready while the source CSA, intervening HCA,
-and other model work execute. The target CSA still writes its real index K and
-compressed KV from its own input; only its duplicate query/top-k work is
-skipped. The first CSA layer has no predecessor and uses the normal same-layer
-index path.
-
-Two target-side policies are available:
-
-- <code>scout</code> (default): a non-mutating CUDA classifier replaces misses
-  with -1 in the GPU index list and produces their pinned-host locations.
-  FlashMLA computes SWA + resident C4 hits and returns output/LSE while a CPU
-  worker dequantizes the page-padded FP8 E4M3FN + UE8M0 C4 rows and computes
-  the miss partial attention with the target layer's **real Q**. The two
-  disjoint partitions are merged with a stable natural-log LSE merge.
-- <code>infinigen</code>: the predicted target top-k runs the full HiSparse swap-in
-  on a side stream. The target layer waits on a per-layer event, so H2D
-  transfer is pipelined with the source/intervening layer computation.
-
-In <code>scout</code> mode, every <code>dsv4_recall_interval</code> global decode
-batches (default 8), the same selected top-k runs a real full swap-in after the
-layer's attention. This updates residency and LRU state for later steps; it is
-not a dummy working-buffer copy. Before that layer's next classification, a
-per-layer event orders any unfinished periodic recall, making blocking visible
-in the profile.
-
-DeepSeek V4 options inside <code>--hisparse-config</code>:
-
-| Parameter | Default | Description |
-| --- | --- | --- |
-| <code>dsv4_prefetch_mode</code> | <code>"scout"</code> | <code>"scout"</code> host-miss attention or <code>"infinigen"</code> side-stream recall |
-| <code>dsv4_recall_interval</code> | <code>8</code> | Real periodic H2D recall interval in global decode batches; non-positive disables it |
-| <code>dsv4_cpu_attention_backend</code> | <code>"auto"</code> | CPU selector; <code>"auto"</code> and <code>"torch"</code> currently use the PyTorch dispatcher |
-| <code>dsv4_cpu_threads</code> | <code>0</code> | PyTorch CPU intra-op threads; 0 preserves the process setting |
-| <code>dsv4_profile</code> | <code>false</code> | Enable per-layer CUDA event and CPU wall-clock aggregation |
-| <code>dsv4_profile_log_interval</code> | <code>100</code> | Decode batches between profile summaries |
-
-Explicitly setting <code>dsv4_prefetch_mode</code> enables the DeepSeek-V4
-host-backed sparse runtime; <code>--enable-hisparse</code> is not required.
-Without an explicit mode or the legacy flag, DeepSeek V4 retains its regular
-pool and attention path. The old values <code>"cpu"</code> and
-<code>"h2d"</code> remain aliases for <code>"scout"</code> and
-<code>"infinigen"</code>, respectively, and emit a deprecation warning.
-
-The CPU reference backend's QK/PV matrix multiplications go through PyTorch's
-oneDNN/MKL dispatcher, which selects AVX2, AVX-512, or AMX kernels supported by
-the host CPU. Startup logs report the selected CPU capability and thread count.
-
-Profiling adds <code>torch.profiler</code> scopes named
-<code>dsv4_sparse/*</code> and per-layer mean/p50/p95/max logs for index
-generation, CPU dequant/QK/PV/total, GPU hit attention, target wait,
-H2D/classification prefetch, periodic recall, periodic wait, miss bytes, and an
-estimated prefetch overlap coverage plus CPU/GPU attention overlap coverage and
-the unhidden CPU tail. Profiling uses synchronizing timing events
-and should be enabled only for diagnosis.
-
-Current DeepSeek V4 constraints are CUDA, PP=1, no speculative decoding, and
-eager decode (<code>--disable-decode-cuda-graph</code>). On SM120, ScoutAttention mode
-additionally requires <code>SGLANG_SM120_FLASHMLA_BACKEND=triton</code> because
-the default FlashInfer path does not return LSE.
-
-Example ScoutAttention mode:
-
-~~~bash
---disable-decode-cuda-graph \
---hisparse-config='{"top_k":512,"device_buffer_size":4096,"dsv4_prefetch_mode":"scout","dsv4_recall_interval":8,"dsv4_profile":true}'
-~~~
-
-Example InfiniGen mode:
-
-~~~bash
---disable-decode-cuda-graph \
---hisparse-config='{"top_k":512,"device_buffer_size":4096,"dsv4_prefetch_mode":"infinigen"}'
-~~~
-
 ### Shared-index prefetch (automatic)
 
 When a model reuses one anchor layer's top-k selection across a run of subsequent "skip" layers (DSA `index_topk_freq` / `index_topk_pattern`; native in GLM-5.2 as IndexShare), the working set of every skip layer is known the moment the anchor's index is computed. HiSparse exploits this automatically: the anchor's swap-in kernel records its miss plan (which host slots go to which device-buffer slots), and each skip layer replays that plan with a copy-only kernel issued ahead on a side stream, so the skip layers' host→device IO overlaps the intervening layers' compute instead of sitting on the decode critical path. The replay kernel uses a small fixed grid to keep its SM footprint low while overlapped.
@@ -212,11 +126,7 @@ The prefetch is enabled automatically for eligible models (no pipeline paralleli
 
 ## Deployment
 
-Legacy DSA HiSparse remains a PD-decode deployment. DeepSeek-V4
-ScoutAttention/InfiniGen can run either in a regular server or on a PD decode
-server. If the same explicit mode config is passed to both PD roles, the
-prefill server warns and keeps its regular KV pool while the decode server
-activates the host-backed sparse runtime.
+HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
 
 ### Prefill Instance
 
@@ -249,7 +159,6 @@ python3 -m sglang.launch_server \
     --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3 \
     --dist-init-addr 127.0.0.1:5757 \
     --nnodes 1 --node-rank 0 \
-    --disable-decode-cuda-graph \
     --enable-hisparse \
     --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'
 ```
@@ -277,11 +186,8 @@ python3 -m sglang.bench_serving \
 
 ### Key Notes
 
-- A PD prefill instance does not create the DeepSeek-V4 host-backed decode pool.
-  An explicit DSV4 mode on prefill is ignored with a warning.
-- On DeepSeek V4, an explicit `dsv4_prefetch_mode` activates ScoutAttention or
-  InfiniGen without `--enable-hisparse`; the legacy flag without a mode still
-  defaults to ScoutAttention.
+- The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
+- On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
 - On SM120/SM121 (e.g. RTX PRO 6000, RTX 5090) with GLM DSA models and `--kv-cache-dtype fp8_e4m3`, both DSA backends resolve to `flashinfer_sparse_mla`, which is the only DSA kernel available on that architecture. HiSparse accepts it there; no extra flag is needed.
 - For DeepSeek V4, DSA backend flags are not applicable. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.

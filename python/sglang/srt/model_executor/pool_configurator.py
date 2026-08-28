@@ -793,7 +793,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if kvc.sparse_runtime_policy.enabled:
+        if kvc.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
@@ -803,10 +803,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
         if self.c4_shrink_factor > 1:
-            logger.info(
-                "DeepSeek-V4 sparse runtime c4 host-to-device ratio = %d",
-                self.c4_shrink_factor,
-            )
+            logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)

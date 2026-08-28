@@ -485,7 +485,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         sliding_window: int = 128,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        enable_sparse_runtime: bool = False,
+        enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
     ):
@@ -617,7 +617,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
-            if enable_sparse_runtime:
+            if enable_hisparse:
                 c4_kv_pool_type = HiSparseC4DevicePool
             self.c4_kv_pool = self._make_kv_pool(
                 size=c4_size,

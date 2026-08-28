@@ -609,9 +609,7 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda
-            or self.online_c128_mtp.enabled()
-            or self.hisparse_coordinator is not None
+            not _is_cuda or self.online_c128_mtp.enabled()
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
@@ -1722,34 +1720,12 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            cpu_miss_active = False
-            gpu_timing_events = None
-            if (
-                compress_ratio == 4
-                and forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
-                cpu_miss_active = (
-                    self.hisparse_coordinator.launch_dsv4_cpu_attention(
-                        physical_layer_id=layer_id,
-                        q=q,
-                        softmax_scale=self.softmax_scale,
-                        head_dim_v=self.head_dim_v,
-                    )
-                )
-                if cpu_miss_active and self.hisparse_coordinator.dsv4_profile:
-                    gpu_timing_events = (
-                        torch.cuda.Event(enable_timing=True),
-                        torch.cuda.Event(enable_timing=True),
-                    )
-                    gpu_timing_events[0].record()
-
             if _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
 
-                o, gpu_lse = flash_mla_with_kvcache_sm120(
+                o = flash_mla_with_kvcache_sm120(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -1760,14 +1736,14 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )
+                )[0]
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                o, gpu_lse = flash_mla_with_kvcache(
+                o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -1782,24 +1758,8 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )
+                )[0]
 
-            if cpu_miss_active:
-                if gpu_lse is None:
-                    raise RuntimeError(
-                        "DeepSeek-V4 HiSparse CPU mode requires an attention "
-                        "backend that returns LSE. On SM120 set "
-                        "SGLANG_SM120_FLASHMLA_BACKEND=triton."
-                    )
-                if gpu_timing_events is not None:
-                    gpu_timing_events[1].record()
-                o = self.hisparse_coordinator.finish_dsv4_cpu_attention(
-                    physical_layer_id=layer_id,
-                    gpu_output=o,
-                    gpu_lse=gpu_lse,
-                    attn_sink=attn_sink,
-                    gpu_timing_events=gpu_timing_events,
-                )
             o = o.squeeze(1)
             return o
 

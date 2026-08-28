@@ -1538,16 +1538,6 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
-        hisparse_coordinator = getattr(attn_backend, "hisparse_coordinator", None)
-        if self.compress_ratio == 4 and hisparse_coordinator is not None:
-            hisparse_coordinator.launch_dsv4_next_csa_prefetch(
-                source_layer_id=self.layer_id,
-                x=x,
-                positions=positions,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
-
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -3133,15 +3123,6 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        if forward_batch.forward_mode.is_decode():
-            attn_backend = get_attn_backend()
-            hisparse_coordinator = getattr(
-                attn_backend, "hisparse_coordinator", None
-            )
-            if hisparse_coordinator is not None:
-                hisparse_coordinator.register_dsv4_csa_layers(
-                    [self.layers[i] for i in range(self.start_layer, self.end_layer)]
-                )
         if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.

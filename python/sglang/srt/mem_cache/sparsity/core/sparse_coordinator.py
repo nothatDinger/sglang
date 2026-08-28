@@ -63,19 +63,6 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
-    # DeepSeek-V4 CSA decode prefetch. ScoutAttention evaluates host misses in
-    # parallel with GPU hits; InfiniGen stages the predicted working set before
-    # the target CSA.
-    dsv4_prefetch_mode: str = "scout"
-    dsv4_prefetch_mode_explicit: bool = False
-    dsv4_prefetch_mode_deprecated_alias: Optional[str] = None
-    # In ScoutAttention mode, materialize the selected set in the GPU cache
-    # every N decode batches. A non-positive value disables periodic recall.
-    dsv4_recall_interval: int = 8
-    dsv4_cpu_attention_backend: str = "auto"
-    dsv4_cpu_threads: int = 0
-    dsv4_profile: bool = False
-    dsv4_profile_log_interval: int = 100
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
