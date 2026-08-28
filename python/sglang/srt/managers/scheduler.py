@@ -4626,7 +4626,17 @@ class Scheduler(
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
-        # todo hisparse, release resources for abort requests in hisparse coordinator
+        if self.hisparse_coordinator is not None:
+            aborted_reqs = self.hisparse_coordinator.abort_staging_requests(
+                abort_all=recv_req.abort_all, rid=recv_req.rid
+            )
+            for req in aborted_reqs:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req), req
+                )
+                release_kv_cache(req, self.tree_cache)
+                logger.debug(f"Abort HiSparse staging request. {req.rid=}")
+
         # Abort requests still waiting for encoder embeddings (EPD language-only)
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)

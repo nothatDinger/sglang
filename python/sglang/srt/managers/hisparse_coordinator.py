@@ -180,10 +180,9 @@ class HiSparseCoordinator:
                 self.mem_pool_device.kv_cache_total_dim
                 * self.mem_pool_device.store_dtype.itemsize
             )
-            # C4 stores 576 data bytes plus 8 UE8M0 scale bytes per token.
-            # The swap kernel ignores item_size_bytes for the page-padded DSV4
-            # layout, but profiling needs the real transfer payload.
-            self.dsv4_item_size_bytes = self.item_size_bytes + 8
+            # kv_cache_total_dim already includes the 576-byte value and the
+            # 8-byte UE8M0 scale transferred for each C4 token.
+            self.dsv4_item_size_bytes = self.item_size_bytes
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -1792,37 +1791,75 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
+    def abort_staging_requests(self, abort_all: bool, rid: str) -> List[Req]:
+        """Remove matching staging requests and release their sparse resources."""
+        if not self.ack_staging_queue:
+            return []
+
+        aborted_acts = [
+            act
+            for act in self.ack_staging_queue
+            if abort_all or act.req.rid.startswith(rid)
+        ]
+        if not aborted_acts:
+            return []
+
+        # Do not recycle host/device indices while staging DMA may still use them.
+        # If synchronization fails, leave the requests queued and their state intact.
+        aborted_acts[-1].finish_event.synchronize()
+
+        aborted_act_ids = {id(act) for act in aborted_acts}
+        self.ack_staging_queue = [
+            act for act in self.ack_staging_queue if id(act) not in aborted_act_ids
+        ]
+
+        aborted_reqs = [act.req for act in aborted_acts]
+        self._release_staging_requests(aborted_reqs)
+        return aborted_reqs
+
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
-        # Remove from staging queue
+        finish_event = next(
+            (
+                act.finish_event
+                for act in reversed(self.ack_staging_queue)
+                if act.req is req
+            ),
+            None,
+        )
+        if finish_event is not None:
+            finish_event.synchronize()
+        else:
+            self.write_staging_stream.synchronize()
+
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
         ]
-        # Wait for any in-flight staging DMA to complete before freeing
-        self.write_staging_stream.synchronize()
+        self._release_staging_requests([req])
 
-        prefill_len = req.extend_range.end
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
-        ]
-        self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+    def _release_staging_requests(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            prefill_len = req.extend_range.end
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :prefill_len
+            ]
+            self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
-        # Free host memory that was allocated during admit_request_into_staging
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self._skip_first_backup[req.req_pool_idx] = False
-        req.hisparse_staging = False
+            host_indices = self.mem_pool_host.allocated_host_indices(
+                self.req_to_host_pool,
+                req.req_pool_idx,
+                self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            )
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+            self.req_to_host_pool[req.req_pool_idx, :] = -1
+            self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+            self._skip_first_backup[req.req_pool_idx] = False
+            req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
