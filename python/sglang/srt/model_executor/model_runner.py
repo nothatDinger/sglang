@@ -932,6 +932,7 @@ class ModelRunner:
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
             dsv4_prefetch_mode=hisparse_cfg.dsv4_prefetch_mode,
+            dsv4_prefetch_correction=hisparse_cfg.dsv4_prefetch_correction,
             dsv4_recall_interval=hisparse_cfg.dsv4_recall_interval,
             dsv4_cpu_attention_backend=hisparse_cfg.dsv4_cpu_attention_backend,
             dsv4_cpu_threads=hisparse_cfg.dsv4_cpu_threads,

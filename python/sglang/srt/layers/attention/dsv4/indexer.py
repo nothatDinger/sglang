@@ -676,23 +676,26 @@ class C4IndexerBackendMixin:
             hisparse_decode
             and hisparse_coordinator.is_dsv4_prediction(c4_indexer.layer_id)
         )
+        correcting_prefetch = False
         if hisparse_decode and not dsv4_prediction:
             prefetched_indices = hisparse_coordinator.try_consume_dsv4_prefetch(
                 physical_layer_id=c4_indexer.layer_id,
                 num_reqs=num_queries,
             )
             if prefetched_indices is not None:
-                # The target layer still writes its real index K from its own
-                # input. Only its query/top-k computation is replaced by the
-                # previous CSA input prediction.
-                self.forward_indexer_compressor(
-                    x=x,
-                    forward_batch=forward_batch,
-                    layer_id=c4_indexer.layer_id,
-                    compressor=c4_indexer.compressor,
-                )
-                core_metadata.c4_sparse_page_indices = prefetched_indices
-                return
+                correcting_prefetch = hisparse_coordinator.dsv4_prefetch_correction
+                if not correcting_prefetch:
+                    # The target layer still writes its real index K from its own
+                    # input. Only its query/top-k computation is replaced by the
+                    # previous CSA input prediction.
+                    self.forward_indexer_compressor(
+                        x=x,
+                        forward_batch=forward_batch,
+                        layer_id=c4_indexer.layer_id,
+                        compressor=c4_indexer.compressor,
+                    )
+                    core_metadata.c4_sparse_page_indices = prefetched_indices
+                    return
 
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
@@ -894,14 +897,24 @@ class C4IndexerBackendMixin:
             return
         if hisparse_coordinator is not None:
             if hisparse_decode:
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.process_dsv4_current_index(
-                        physical_layer_id=c4_indexer.layer_id,
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
+                if correcting_prefetch:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.correct_dsv4_prefetch(
+                            physical_layer_id=c4_indexer.layer_id,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                        )
                     )
-                )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.process_dsv4_current_index(
+                            physical_layer_id=c4_indexer.layer_id,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                        )
+                    )
             else:
                 # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (

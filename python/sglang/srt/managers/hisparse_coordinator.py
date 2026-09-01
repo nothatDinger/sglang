@@ -132,6 +132,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
         dsv4_prefetch_mode: str = DSV4_PREFETCH_MODE_SCOUT,
+        dsv4_prefetch_correction: bool = False,
         dsv4_recall_interval: int = 8,
         dsv4_cpu_attention_backend: str = "auto",
         dsv4_cpu_threads: int = 0,
@@ -154,6 +155,9 @@ class HiSparseCoordinator:
         )
         self.dsv4_prefetch_mode = (
             dsv4_prefetch_mode if self.is_dsv4_hisparse else None
+        )
+        self.dsv4_prefetch_correction = (
+            dsv4_prefetch_correction if self.is_dsv4_hisparse else False
         )
         self.dsv4_recall_interval = dsv4_recall_interval
         self.dsv4_cpu_attention_backend = dsv4_cpu_attention_backend
@@ -754,6 +758,40 @@ class HiSparseCoordinator:
             self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
         return result
 
+    def correct_dsv4_prefetch(
+        self,
+        *,
+        physical_layer_id: int,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fetch misses from the target layer's calibrated top-k selection.
+
+        The prediction has already populated the device buffer, so the normal
+        HiSparse swap-in planner copies only target tokens that it did not
+        predict. The returned locations describe the exact calibrated top-k.
+        """
+        if not self.dsv4_prefetch_correction:
+            raise RuntimeError("DeepSeek-V4 prefetch correction is disabled")
+        compressed_layer = self._dsv4_compressed_layer_id(physical_layer_id)
+        num_reqs = self._prepare_dsv4_selection(
+            compressed_layer=compressed_layer,
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=compressed_seq_lens,
+            top_k_result=top_k_result,
+        )
+        return self._run_swap_in_kernel(
+            self.dsv4_batch_req_indices[compressed_layer, :num_reqs],
+            self.dsv4_batch_seq_lens[compressed_layer, :num_reqs],
+            self.dsv4_predicted_raw_indices[compressed_layer, :num_reqs],
+            compressed_layer,
+            output_buffer=self.dsv4_predicted_device_locs[
+                compressed_layer, :num_reqs
+            ],
+            num_real_reqs=self.dsv4_batch_num_reqs[compressed_layer],
+        )
+
     def try_consume_dsv4_prefetch(
         self,
         *,
@@ -801,7 +839,10 @@ class HiSparseCoordinator:
             )
 
         self._dsv4_ready[compressed_layer] = False
-        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
+        if (
+            self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT
+            and not self.dsv4_prefetch_correction
+        ):
             self._dsv4_active_cpu_layers[physical_layer_id] = compressed_layer
         return self.dsv4_predicted_device_locs[
             compressed_layer, :num_reqs

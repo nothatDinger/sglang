@@ -69,6 +69,8 @@ class SparseConfig:
     dsv4_prefetch_mode: str = "scout"
     dsv4_prefetch_mode_explicit: bool = False
     dsv4_prefetch_mode_deprecated_alias: Optional[str] = None
+    # Fetch target-layer cache misses after correcting the predicted selection.
+    dsv4_prefetch_correction: bool = False
     # In ScoutAttention mode, materialize the selected set in the GPU cache
     # every N decode batches. A non-positive value disables periodic recall.
     dsv4_recall_interval: int = 8
