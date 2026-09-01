@@ -97,6 +97,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     dsv4_prefetch_mode_selection = resolve_dsv4_prefetch_mode(extra_config)
     if dsv4_prefetch_mode_selection.explicit:
         extra_config.pop("dsv4_prefetch_mode")
+    dsv4_prefetch_correction = extra_config.pop("dsv4_prefetch_correction", False)
     dsv4_recall_interval = extra_config.pop("dsv4_recall_interval", 8)
     dsv4_cpu_attention_backend = extra_config.pop(
         "dsv4_cpu_attention_backend", "auto"
@@ -107,6 +108,16 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         "dsv4_profile_log_interval", 100
     )
 
+    if not isinstance(dsv4_prefetch_correction, bool):
+        raise ValueError("dsv4_prefetch_correction must be a boolean")
+    if dsv4_prefetch_correction and not (
+        dsv4_prefetch_mode_selection.explicit
+        or bool(getattr(server_args, "enable_hisparse", False))
+    ):
+        raise ValueError(
+            "dsv4_prefetch_correction requires ScoutAttention/InfiniGen prefetch; "
+            "set dsv4_prefetch_mode or enable HiSparse"
+        )
     if (
         not isinstance(dsv4_recall_interval, int)
         or isinstance(dsv4_recall_interval, bool)
@@ -146,6 +157,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         dsv4_prefetch_mode_deprecated_alias=(
             dsv4_prefetch_mode_selection.deprecated_alias
         ),
+        dsv4_prefetch_correction=dsv4_prefetch_correction,
         dsv4_recall_interval=dsv4_recall_interval,
         dsv4_cpu_attention_backend=dsv4_cpu_attention_backend,
         dsv4_cpu_threads=dsv4_cpu_threads,

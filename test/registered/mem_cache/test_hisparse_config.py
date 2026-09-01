@@ -30,6 +30,7 @@ def test_dsv4_prefetch_defaults_to_scout_without_explicit_activation():
     assert config.dsv4_prefetch_mode_explicit is False
     assert config.dsv4_prefetch_mode_deprecated_alias is None
     assert config.dsv4_recall_interval == 8
+    assert config.dsv4_prefetch_correction is False
     assert config.dsv4_cpu_attention_backend == "auto"
     assert config.dsv4_cpu_threads == 0
     assert config.dsv4_profile is False
@@ -51,7 +52,8 @@ def test_dsv4_prefetch_explicit_infinigen_and_profile():
     config = _parse(
         '{"dsv4_prefetch_mode":"infinigen","dsv4_recall_interval":0,'
         '"dsv4_cpu_attention_backend":"torch","dsv4_cpu_threads":16,'
-        '"dsv4_profile":true,"dsv4_profile_log_interval":7}'
+        '"dsv4_profile":true,"dsv4_profile_log_interval":7,'
+        '"dsv4_prefetch_correction":true}'
     )
     assert config.dsv4_prefetch_mode == "infinigen"
     assert config.dsv4_prefetch_mode_explicit is True
@@ -61,6 +63,7 @@ def test_dsv4_prefetch_explicit_infinigen_and_profile():
     assert config.dsv4_cpu_threads == 16
     assert config.dsv4_profile is True
     assert config.dsv4_profile_log_interval == 7
+    assert config.dsv4_prefetch_correction is True
 
 
 @pytest.mark.parametrize(
@@ -136,6 +139,8 @@ def test_legacy_alias_and_pd_prefill_emit_warnings(caplog):
         ('{"dsv4_cpu_threads":-1}', "dsv4_cpu_threads"),
         ('{"dsv4_profile":1}', "dsv4_profile"),
         ('{"dsv4_profile_log_interval":0}', "dsv4_profile_log_interval"),
+        ('{"dsv4_prefetch_correction":1}', "dsv4_prefetch_correction"),
+        ('{"dsv4_prefetch_correction":true}', "requires ScoutAttention"),
         ("[]", "JSON object"),
     ],
 )
