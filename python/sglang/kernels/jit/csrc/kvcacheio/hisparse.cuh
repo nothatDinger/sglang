@@ -925,6 +925,8 @@ void classify_cache_residency(
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView num_real_reqs) {
+  using namespace host;
+
   const int64_t bs = top_k_tokens.shape()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
   const int64_t buffer_stride = device_buffer_tokens.strides()[0];

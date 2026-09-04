@@ -64,6 +64,24 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 _arange_cache = {}
 
 
+def exclude_active_compression(
+    c4_seq_lens: torch.Tensor,
+    active_compression: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        c4_seq_lens - active_compression.to(dtype=c4_seq_lens.dtype)
+    ).clamp(min=1)
+
+
+def has_active_compression(
+    seq_lens_cpu: Optional[torch.Tensor],
+    count: int,
+) -> bool:
+    if seq_lens_cpu is None:
+        return False
+    return any(int(seq_len) % 4 == 0 for seq_len in seq_lens_cpu[:count])
+
+
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -767,6 +785,7 @@ class C4IndexerBackendMixin:
             return F.pad(tensor, pad, value=value)
 
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        deep_gemm_metadata = indexer_metadata.deep_gemm_metadata
         if dsv4_prediction:
             # The target CSA compressor has not run yet. Exclude the C4 token
             # produced by this decode step at compression boundaries; it is
@@ -775,7 +794,21 @@ class C4IndexerBackendMixin:
             active_compression = (
                 forward_batch.seq_lens[:query_rows].remainder(4) == 0
             )
-            c4_seq_lens = (c4_seq_lens - active_compression).clamp(min=1)
+            c4_seq_lens = exclude_active_compression(
+                c4_seq_lens,
+                active_compression,
+            )
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            compression_boundary = has_active_compression(
+                seq_lens_cpu,
+                query_rows,
+            )
+            if not compression_boundary and seq_lens_cpu is None:
+                compression_boundary = bool(active_compression.any().item())
+            if compression_boundary and deep_gemm_metadata is not None:
+                deep_gemm_metadata = indexer_metadata.build_deep_gemm_metadata(
+                    c4_seq_lens
+                )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
         c4_sparse_page_indices = match_num_queries(
@@ -825,7 +858,7 @@ class C4IndexerBackendMixin:
                 weights,
                 _c4sl,
                 page_table,
-                indexer_metadata.deep_gemm_metadata,
+                deep_gemm_metadata,
                 indexer_metadata.max_c4_seq_len,
                 False,
             )

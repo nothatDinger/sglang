@@ -920,6 +920,9 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
+        elif self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x)
+            q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
         return self.q_norm(q)

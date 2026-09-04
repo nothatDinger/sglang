@@ -121,36 +121,7 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or is_xpu()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ) and not self.force_deep_gemm_metadata:
-            self.deep_gemm_metadata = None
-        else:
-            import deep_gemm
-
-            use_jit_indexer = not self.force_deep_gemm_metadata and (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.kernels.ops.attention.dsv4 import (
-                    get_paged_mqa_logits_metadata,
-                )
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
-
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
-
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+        self.deep_gemm_metadata = self.build_deep_gemm_metadata(self.c4_seq_lens)
 
         from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
@@ -160,6 +131,42 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+
+    def build_deep_gemm_metadata(
+        self,
+        c4_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        ) and not self.force_deep_gemm_metadata:
+            return None
+        else:
+            import deep_gemm
+
+            use_jit_indexer = not self.force_deep_gemm_metadata and (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            )
+            if use_jit_indexer:
+                from sglang.kernels.ops.attention.dsv4 import (
+                    get_paged_mqa_logits_metadata,
+                )
+            else:
+                from deep_gemm import get_paged_mqa_logits_metadata
+
+            _c4 = c4_seq_lens.to(torch.int32)
+            if _c4.dim() == 1:
+                _c4 = _c4.unsqueeze(-1)
+            deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                _c4,
+                self.c4_page_size,
+                deep_gemm.get_num_sms(),
+            )
+
+            assert isinstance(deep_gemm_metadata, torch.Tensor)
+            return deep_gemm_metadata
 
     @property
     def c4_page_size(self) -> int:
