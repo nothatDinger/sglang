@@ -259,6 +259,7 @@ set(SOURCES
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
+    "csrc/cpu/dsv4_hisparse_cpu_attention.cpp"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
@@ -322,6 +323,15 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+
+# This host operator ships in the CUDA wheel as well as the CPU wheel. Keep
+# its x86 code generation equivalent to csrc/cpu/CMakeLists.txt.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set_source_files_properties(
+        csrc/cpu/dsv4_hisparse_cpu_attention.cpp
+        PROPERTIES COMPILE_OPTIONS "-march=x86-64-v4;-mavx512bf16;-mamx-tile;-mamx-bf16"
+    )
+endif()
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)

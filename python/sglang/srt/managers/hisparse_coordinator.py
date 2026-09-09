@@ -1022,7 +1022,7 @@ class HiSparseCoordinator:
         self.dsv4_d2h_stream.wait_stream(current_stream)
         copy_done = self._dsv4_cpu_copy_events[compressed_layer]
         with device_module.stream(self.dsv4_d2h_stream):
-            query_cpu.copy_(query[:num_real_reqs], non_blocking=True)
+            query_cpu[:num_real_reqs].copy_(query[:num_real_reqs], non_blocking=True)
             miss_cpu.copy_(miss_gpu, non_blocking=True)
             copy_done.record(self.dsv4_d2h_stream)
 
