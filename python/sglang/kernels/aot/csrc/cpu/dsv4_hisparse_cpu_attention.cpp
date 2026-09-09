@@ -2,14 +2,12 @@
 Licensed under the Apache License, Version 2.0. */
 
 #include <ATen/ATen.h>
-#include <ATen/Parallel.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <vector>
 
 int64_t dsv4_hisparse_cpu_attention(
     const at::Tensor& query,
@@ -38,14 +36,10 @@ int64_t dsv4_hisparse_cpu_attention(
   constexpr int64_t kDim = 512;
   constexpr int64_t kScaleBytes = 8;
   const auto batches = query.size(0);
-  const auto heads = query.size(1);
   const auto max_misses = miss_locs.size(1);
   const auto page_stride = host_cache.stride(0);
-  const auto* q = query.const_data_ptr<at::BFloat16>();
   const auto* locs = miss_locs.const_data_ptr<int64_t>();
   const auto* cache = host_cache.const_data_ptr<uint8_t>();
-  auto* out = output.mutable_data_ptr<at::BFloat16>();
-  auto* out_lse = lse.mutable_data_ptr<float>();
 
   auto fp8 = [](uint8_t bits) -> float {
     const float sign = bits & 0x80 ? -1.0f : 1.0f;
@@ -74,49 +68,36 @@ int64_t dsv4_hisparse_cpu_attention(
 
   output.zero_();
   lse.fill_(-std::numeric_limits<float>::infinity());
-  at::parallel_for(0, batches * heads, 1, [&](int64_t begin, int64_t end) {
-    for (int64_t work = begin; work < end; ++work) {
-      const int64_t b = work / heads;
-      const int64_t h = work % heads;
-      int64_t count = 0;
-      while (count < max_misses && locs[b * max_misses + count] >= 0)
-        ++count;
-      if (count == 0) continue;
-      // Keep scratch rows aligned for oneDNN/AMX-friendly 16/32-token shapes.
-      const int64_t padded = (count + 31) & ~int64_t(31);
-      std::vector<float> scores(padded, -std::numeric_limits<float>::infinity());
-      std::vector<at::BFloat16> kv(padded * kDim);
-      for (int64_t m = 0; m < count; ++m) {
-        const int64_t loc = locs[b * max_misses + m];
-        for (int64_t d = 0; d < kDim; ++d)
-          kv[m * kDim + d] = at::BFloat16(kv_value(loc, d));
-      }
-      const auto* q_row = q + (b * heads + h) * kDim;
-      float maximum = -std::numeric_limits<float>::infinity();
-      for (int64_t m = 0; m < count; ++m) {
-        float score = 0.0f;
-        for (int64_t d = 0; d < kDim; ++d)
-          score += static_cast<float>(q_row[d]) * static_cast<float>(kv[m * kDim + d]);
-        scores[m] = score * static_cast<float>(softmax_scale);
-        maximum = std::max(maximum, scores[m]);
-      }
-      float sum = 0.0f;
-      for (int64_t m = 0; m < count; ++m)
-        sum += std::exp(scores[m] - maximum);
-      out_lse[b * heads + h] = maximum + std::log(sum);
-      auto* out_row = out + (b * heads + h) * head_dim_v;
-      for (int64_t d = 0; d < head_dim_v; ++d) {
-        float value = 0.0f;
-        for (int64_t m = 0; m < count; ++m)
-          value += std::exp(scores[m] - maximum) / sum * static_cast<float>(kv[m * kDim + d]);
-        out_row[d] = at::BFloat16(value);
-      }
-    }
-  });
+  static thread_local at::Tensor kv_workspace;
   int64_t miss_tokens = 0;
-  for (int64_t b = 0; b < batches; ++b)
-    for (int64_t m = 0; m < max_misses && locs[b * max_misses + m] >= 0; ++m)
-      ++miss_tokens;
+  for (int64_t b = 0; b < batches; ++b) {
+    int64_t count = 0;
+    while (count < max_misses && locs[b * max_misses + count] >= 0)
+      ++count;
+    miss_tokens += count;
+    if (count == 0) continue;
+
+    // Dequantize once per request into a 32-row-aligned BF16 workspace. QK and
+    // PV then dispatch as BF16 GEMMs (FP32 accumulation on oneDNN/AMX), shared
+    // by every valid head. Probabilities are materialized once in FP32.
+    const int64_t padded = (count + 31) & ~int64_t(31);
+    if (!kv_workspace.defined() || kv_workspace.size(0) < padded)
+      kv_workspace = at::empty({padded, kDim}, query.options());
+    auto kv = kv_workspace.narrow(0, 0, padded);
+    kv.zero_();
+    auto* kv_data = kv.mutable_data_ptr<at::BFloat16>();
+    for (int64_t m = 0; m < count; ++m) {
+      const int64_t loc = locs[b * max_misses + m];
+      for (int64_t d = 0; d < kDim; ++d)
+        kv_data[m * kDim + d] = at::BFloat16(kv_value(loc, d));
+    }
+    auto valid_kv = kv.narrow(0, 0, count);
+    auto scores = at::matmul(query.select(0, b), valid_kv.transpose(0, 1));
+    scores.mul_(softmax_scale);
+    lse.select(0, b).copy_(at::logsumexp(scores.to(at::kFloat), {1}));
+    auto probability = at::softmax(scores.to(at::kFloat), 1).to(at::kBFloat16);
+    output.select(0, b).copy_(at::matmul(probability, valid_kv.narrow(1, 0, head_dim_v)));
+  }
   return miss_tokens;
 }
 

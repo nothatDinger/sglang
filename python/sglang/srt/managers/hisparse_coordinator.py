@@ -487,11 +487,27 @@ class HiSparseCoordinator:
                 if hasattr(torch.backends.cpu, "get_cpu_capability")
                 else "unknown"
             )
+            native_available = hasattr(
+                torch.ops.sgl_kernel, "dsv4_hisparse_cpu_attention"
+            )
+            self._dsv4_effective_cpu_attention_backend = (
+                "native"
+                if self.dsv4_cpu_attention_backend == "auto" and native_available
+                else "torch"
+            )
+            self._dsv4_native_dtype_warned = False
+            if self.dsv4_cpu_attention_backend == "auto" and not native_available:
+                logger.warning(
+                    "DeepSeek-V4 ScoutAttention native CPU operator is unavailable; "
+                    "falling back to the Torch reference backend."
+                )
             logger.info(
                 "DeepSeek-V4 ScoutAttention enabled, "
-                "recall_interval=%d, cpu_backend=%s, cpu_capability=%s, "
+                "recall_interval=%d, cpu_backend=%s (configured=%s), "
+                "cpu_capability=%s, "
                 "torch_threads=%d",
                 self.dsv4_recall_interval,
+                self._dsv4_effective_cpu_attention_backend,
                 self.dsv4_cpu_attention_backend,
                 cpu_capability,
                 torch.get_num_threads(),
@@ -524,8 +540,8 @@ class HiSparseCoordinator:
             )
             physical_cpus = sorted(node_cpus)
             physical_cpus = [cpu for cpu in physical_cpus if cpu in allowed]
-            tp_size = int(getattr(tp_group, "world_size", 1))
-            tp_rank = int(getattr(tp_group, "rank_in_group", 0))
+            tp_size = torch.distributed.get_world_size(group=tp_group)
+            tp_rank = torch.distributed.get_rank(group=tp_group)
             begin = len(physical_cpus) * tp_rank // tp_size
             end = len(physical_cpus) * (tp_rank + 1) // tp_size
             rank_cpus = physical_cpus[begin:end]
@@ -1036,12 +1052,21 @@ class HiSparseCoordinator:
             with torch.profiler.record_function(
                 f"dsv4_hisparse/cpu_miss_attention/layer_{physical_layer_id}"
             ):
+                if (
+                    self._dsv4_effective_cpu_attention_backend == "native"
+                    and query_cpu.dtype != torch.bfloat16
+                    and not self._dsv4_native_dtype_warned
+                ):
+                    logger.warning(
+                        "DeepSeek-V4 native CPU attention requires BF16 Q; "
+                        "falling back to Torch for dtype=%s.",
+                        query_cpu.dtype,
+                    )
+                    self._dsv4_native_dtype_warned = True
                 attention_fn = (
                     cpu_miss_attention
-                    if self.dsv4_cpu_attention_backend == "torch"
-                    or not hasattr(
-                        torch.ops.sgl_kernel, "dsv4_hisparse_cpu_attention"
-                    )
+                    if self._dsv4_effective_cpu_attention_backend == "torch"
+                    or query_cpu.dtype != torch.bfloat16
                     else cpu_miss_attention_native
                 )
                 timing = attention_fn(
