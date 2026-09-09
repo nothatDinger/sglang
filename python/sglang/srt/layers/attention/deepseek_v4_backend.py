@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -1739,9 +1740,11 @@ class DeepseekV4AttnBackend(
                     )
                 )
                 if cpu_miss_active and self.hisparse_coordinator.dsv4_profile:
+                    gpu_submit_ns = time.perf_counter_ns()
                     gpu_timing_events = (
                         torch.cuda.Event(enable_timing=True),
                         torch.cuda.Event(enable_timing=True),
+                        gpu_submit_ns,
                     )
                     gpu_timing_events[0].record()
 

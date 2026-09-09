@@ -512,6 +512,11 @@ class HiSparseCoordinator:
                 cpu_capability,
                 torch.get_num_threads(),
             )
+            if self.dsv4_profile:
+                logger.warning(
+                    "DeepSeek-V4 ScoutAttention profiling synchronizes the GPU-end "
+                    "timing event; reported latency distributions are perturbed."
+                )
         else:
             logger.info(
                 "DeepSeek-V4 InfiniGen enabled."
@@ -1082,10 +1087,12 @@ class HiSparseCoordinator:
                     output=output_cpu[:num_real_reqs],
                     lse=lse_cpu[:num_real_reqs],
                 )
+                completion_ns = time.perf_counter_ns()
                 return (
                     timing,
                     (run_ns - submit_ns) * 1.0e-6,
                     (compute_ns - run_ns) * 1.0e-6,
+                    completion_ns,
                 )
 
         assert self._dsv4_cpu_executor is not None
@@ -1112,9 +1119,12 @@ class HiSparseCoordinator:
             return gpu_output
         future, output_cpu, lse_cpu, launch_ns = job
         wait_begin_ns = time.perf_counter_ns()
-        timing, executor_queue_ms, d2h_wait_ms = future.result()
+        timing, executor_queue_ms, d2h_wait_ms, completion_ns = future.result()
         cpu_wait_ms = (time.perf_counter_ns() - wait_begin_ns) * 1.0e-6
-        cpu_critical_ms = (time.perf_counter_ns() - launch_ns) * 1.0e-6
+        # Stop the CPU interval when computation actually completes. Time spent
+        # ready while waiting for the target layer is hidden work, not critical
+        # latency.
+        cpu_pipeline_ms = (completion_ns - launch_ns) * 1.0e-6
 
         from sglang.srt.layers.attention.dsv4.hisparse_cpu import (
             merge_cpu_gpu_attention,
@@ -1154,7 +1164,9 @@ class HiSparseCoordinator:
                 "cpu_attention_miss_tokens",
                 float(timing.miss_tokens),
             )
-            self._profile_add(physical_layer_id, "cpu_blocked_ms", cpu_wait_ms)
+            self._profile_add(
+                physical_layer_id, "cpu_target_future_wait_ms", cpu_wait_ms
+            )
             self._profile_add(
                 physical_layer_id, "cpu_executor_queue_ms", executor_queue_ms
             )
@@ -1164,11 +1176,11 @@ class HiSparseCoordinator:
             )
             self._profile_add(
                 physical_layer_id,
-                "cpu_critical_ms",
-                cpu_critical_ms,
+                "cpu_pipeline_to_completion_ms",
+                cpu_pipeline_ms,
             )
             if gpu_timing_events is not None:
-                gpu_start, gpu_end = gpu_timing_events
+                gpu_start, gpu_end, gpu_submit_ns = gpu_timing_events
                 gpu_end.synchronize()
                 gpu_attention_ms = gpu_start.elapsed_time(gpu_end)
                 self._profile_add(
@@ -1176,14 +1188,24 @@ class HiSparseCoordinator:
                     "gpu_hit_attention_ms",
                     gpu_attention_ms,
                 )
-                # Both intervals start immediately before the GPU hit kernel
-                # (the CPU interval also includes its small D2H prologue).
-                # Their difference estimates the CPU tail exposed on the
-                # decode critical path after GPU attention can no longer hide it.
+                # Compare completion timestamps rather than durations with
+                # different origins. The GPU completion timestamp is estimated
+                # from host submission plus CUDA-event duration. It deliberately
+                # avoids synchronizing gpu_start (which would perturb overlap),
+                # so stream queueing before gpu_start is not included.
+                gpu_completion_estimate_ns = gpu_submit_ns + int(
+                    gpu_attention_ms * 1.0e6
+                )
                 self._profile_add(
                     physical_layer_id,
-                    "cpu_unhidden_ms",
-                    max(0.0, cpu_critical_ms - gpu_attention_ms),
+                    "cpu_unhidden_estimate_ms",
+                    max(
+                        0.0,
+                        (completion_ns - gpu_completion_estimate_ns) * 1.0e-6,
+                    ),
+                )
+                self._profile_add(
+                    physical_layer_id, "profile_gpu_end_sync_perturbed", 1.0
                 )
 
         compressed_layer = self._dsv4_active_cpu_layers.pop(physical_layer_id)
@@ -1440,18 +1462,6 @@ class HiSparseCoordinator:
                 summary["prefetch_overlap_coverage"] = (
                     max(0.0, 1.0 - wait_mean / prefetch_mean)
                     if prefetch_mean > 0
-                    else 1.0
-                )
-            if "cpu_critical_ms" in metrics and "cpu_unhidden_ms" in metrics:
-                cpu_critical_mean = sum(metrics["cpu_critical_ms"]) / len(
-                    metrics["cpu_critical_ms"]
-                )
-                cpu_unhidden_mean = sum(metrics["cpu_unhidden_ms"]) / len(
-                    metrics["cpu_unhidden_ms"]
-                )
-                summary["attention_overlap_coverage"] = (
-                    max(0.0, 1.0 - cpu_unhidden_mean / cpu_critical_mean)
-                    if cpu_critical_mean > 0
                     else 1.0
                 )
             logger.info(
