@@ -75,7 +75,7 @@ class SparseConfig:
     # every N decode batches. A non-positive value disables periodic recall.
     dsv4_recall_interval: int = 8
     dsv4_cpu_attention_backend: str = "auto"
-    dsv4_cpu_threads: int = 0
+    dsv4_cpu_threads: int = 8
     dsv4_profile: bool = False
     dsv4_profile_log_interval: int = 100
     sparse_extra_config: dict = field(

@@ -259,6 +259,7 @@ set(SOURCES
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
+    "csrc/cpu/dsv4_hisparse_cpu_attention.cpp"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
@@ -322,6 +323,11 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+
+# This host operator also ships in the CUDA wheel. Compile this translation
+# unit for the baseline host ISA; its BF16 GEMMs enter PyTorch/oneDNN, which
+# performs runtime AVX/AMX dispatch. This keeps CUDA wheels safe on pre-AVX512
+# GPU hosts while retaining AMX acceleration where it is available.
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)

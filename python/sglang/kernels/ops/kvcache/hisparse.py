@@ -434,7 +434,7 @@ def classify_cache_residency_mla(
     num_real_reqs: torch.Tensor | None = None,
     block_size: int = 256,
 ) -> None:
-    """Split selected tokens into GPU hits and host misses without mutation.
+    """Split selected tokens into GPU hits and compacted host misses.
 
     The full swap kernel cannot be used as a no-copy classifier because it
     still changes residency and LRU state. This operation leaves both intact.

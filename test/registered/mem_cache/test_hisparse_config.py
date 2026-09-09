@@ -32,7 +32,7 @@ def test_dsv4_prefetch_defaults_to_scout_without_explicit_activation():
     assert config.dsv4_recall_interval == 8
     assert config.dsv4_prefetch_correction is False
     assert config.dsv4_cpu_attention_backend == "auto"
-    assert config.dsv4_cpu_threads == 0
+    assert config.dsv4_cpu_threads == 8
     assert config.dsv4_profile is False
     assert config.dsv4_profile_log_interval == 100
 
@@ -136,6 +136,7 @@ def test_legacy_alias_and_pd_prefill_emit_warnings(caplog):
         ('{"dsv4_prefetch_mode":[]}', "dsv4_prefetch_mode"),
         ('{"dsv4_recall_interval":true}', "dsv4_recall_interval"),
         ('{"dsv4_cpu_attention_backend":"invalid"}', "dsv4_cpu_attention_backend"),
+        ('{"dsv4_cpu_threads":0}', "dsv4_cpu_threads"),
         ('{"dsv4_cpu_threads":-1}', "dsv4_cpu_threads"),
         ('{"dsv4_profile":1}', "dsv4_profile"),
         ('{"dsv4_profile_log_interval":0}', "dsv4_profile_log_interval"),
