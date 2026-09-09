@@ -1,6 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -135,7 +137,7 @@ class HiSparseCoordinator:
         dsv4_prefetch_correction: bool = False,
         dsv4_recall_interval: int = 8,
         dsv4_cpu_attention_backend: str = "auto",
-        dsv4_cpu_threads: int = 0,
+        dsv4_cpu_threads: int = 8,
         dsv4_profile: bool = False,
         dsv4_profile_log_interval: int = 100,
     ):
@@ -452,13 +454,33 @@ class HiSparseCoordinator:
         self._dsv4_cpu_jobs: Dict[
             int, Tuple[Future, torch.Tensor, torch.Tensor, int]
         ] = {}
+        self._dsv4_cpu_buffers: Dict[
+            int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._dsv4_cpu_copy_events = [
+            device_module.Event() for _ in range(layer_num)
+        ]
         self._dsv4_active_cpu_layers: Dict[int, int] = {}
 
         if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT:
-            if self.dsv4_cpu_threads > 0:
-                torch.set_num_threads(self.dsv4_cpu_threads)
+            if self.dsv4_cpu_threads <= 0:
+                raise ValueError(
+                    "ScoutAttention requires dsv4_cpu_threads to be positive"
+                )
+            # Model loading intentionally reduces PyTorch's process-global
+            # intra-op pool to one thread. Scout owns an explicit, fixed-size
+            # intra-op pool instead; 4/8/10/11 are useful values to sweep.
+            torch.set_num_threads(self.dsv4_cpu_threads)
+            worker_cpus = self._configure_dsv4_cpu_affinity(self.tp_group)
+
+            def init_cpu_worker():
+                if worker_cpus:
+                    os.sched_setaffinity(threading.get_native_id(), worker_cpus)
+
             self._dsv4_cpu_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="sglang-dsv4-attn"
+                max_workers=1,
+                thread_name_prefix="sglang-dsv4-attn",
+                initializer=init_cpu_worker,
             )
             cpu_capability = (
                 torch.backends.cpu.get_cpu_capability()
@@ -478,6 +500,58 @@ class HiSparseCoordinator:
             logger.info(
                 "DeepSeek-V4 InfiniGen enabled."
             )
+
+    def _configure_dsv4_cpu_affinity(self, tp_group) -> set[int]:
+        """Reserve disjoint physical cores for this TP rank's Scout worker.
+
+        The scheduler stays on one rank-local core while the attention worker
+        receives a separate subset. Restricting the worker thread before its
+        first PyTorch op also constrains the lazily-created intra-op workers.
+        """
+        try:
+            from sglang.srt.utils.common import get_physical_cpus_by_numa
+
+            allowed = os.sched_getaffinity(0)
+            physical_by_node = get_physical_cpus_by_numa()
+            allowed_by_node = [
+                set(cpus) & allowed for cpus in physical_by_node.values()
+            ]
+            # NUMA binding normally limits ``allowed`` to the GPU-local node.
+            # If it does not, prefer the lowest node rather than mixing sockets.
+            node_cpus = next(
+                (cpus for cpus in allowed_by_node if cpus),
+                set(),
+            )
+            physical_cpus = sorted(node_cpus)
+            physical_cpus = [cpu for cpu in physical_cpus if cpu in allowed]
+            tp_size = int(getattr(tp_group, "world_size", 1))
+            tp_rank = int(getattr(tp_group, "rank_in_group", 0))
+            begin = len(physical_cpus) * tp_rank // tp_size
+            end = len(physical_cpus) * (tp_rank + 1) // tp_size
+            rank_cpus = physical_cpus[begin:end]
+            required = self.dsv4_cpu_threads + 1
+            if len(rank_cpus) < required:
+                logger.warning(
+                    "ScoutAttention TP rank %d has %d physical CPUs, fewer than "
+                    "scheduler + dsv4_cpu_threads=%d; affinity is not applied.",
+                    tp_rank,
+                    len(rank_cpus),
+                    required,
+                )
+                return set()
+            scheduler_cpu = rank_cpus[0]
+            worker_cpus = set(rank_cpus[1:required])
+            os.sched_setaffinity(threading.get_native_id(), {scheduler_cpu})
+            logger.info(
+                "ScoutAttention TP rank %d CPU affinity: scheduler=%d, worker=%s",
+                tp_rank,
+                scheduler_cpu,
+                sorted(worker_cpus),
+            )
+            return worker_cpus
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("ScoutAttention CPU affinity setup failed: %s", exc)
+            return set()
 
     def register_dsv4_csa_layers(self, layers) -> None:
         """Register local CSA modules and derive the next-CSA relation."""
@@ -608,6 +682,15 @@ class HiSparseCoordinator:
                     f"dsv4_hisparse/predict_index/layer_{target_layer_id}"
                 ):
                     q_lora = target_attn._compute_q_a(x)
+                    # Materialize the complete predicted query from the source
+                    # CSA input so host-miss attention can overlap the layers
+                    # before the target CSA instead of waiting for its Q path.
+                    predicted_q = (
+                        target_attn._compute_q_b(q_lora, positions)
+                        if self.dsv4_prefetch_mode == DSV4_PREFETCH_MODE_SCOUT
+                        and not self.dsv4_prefetch_correction
+                        else None
+                    )
                     target_attn.indexer(
                         x=x,
                         q_lora=q_lora,
@@ -615,6 +698,17 @@ class HiSparseCoordinator:
                         attn_backend=attn_backend,
                         skip_compressor=True,
                     )
+                    if predicted_q is not None:
+                        self._dsv4_active_cpu_layers[target_layer_id] = (
+                            compressed_layer
+                        )
+                        self.launch_dsv4_cpu_attention(
+                            physical_layer_id=target_layer_id,
+                            q=predicted_q,
+                            num_valid_heads=target_attn.attn_mqa.tp_q_head_num,
+                            softmax_scale=target_attn.softmax_scale,
+                            head_dim_v=target_attn.attn_mqa.v_head_dim,
+                        )
             finally:
                 self._dsv4_prediction_physical_layer = None
                 self._dsv4_prediction_compressed_layer = None
@@ -853,6 +947,7 @@ class HiSparseCoordinator:
         *,
         physical_layer_id: int,
         q: torch.Tensor,
+        num_valid_heads: int,
         softmax_scale: float,
         head_dim_v: int,
     ) -> bool:
@@ -863,16 +958,25 @@ class HiSparseCoordinator:
         ):
             return False
         if physical_layer_id in self._dsv4_cpu_jobs:
-            raise RuntimeError(
-                "DeepSeek-V4 CPU attention job already exists for layer "
-                f"{physical_layer_id}"
-            )
+            # The source CSA already launched this job with predicted Q. The
+            # target call only needs to activate the later GPU/CPU LSE merge.
+            return True
 
         from sglang.srt.layers.attention.dsv4.hisparse_cpu import (
             cpu_miss_attention,
+            cpu_miss_attention_native,
         )
 
         query = q.squeeze(1)
+        if not 0 < num_valid_heads <= query.shape[1]:
+            raise ValueError(
+                "DeepSeek-V4 CPU attention valid head count must be in "
+                f"[1, {query.shape[1]}], got {num_valid_heads}."
+            )
+        # FlashMLA may pad each TP rank's Q to 64 heads. Host attention only
+        # operates on the rank-local heads; slicing before D2H also avoids
+        # transferring padded Q and output rows.
+        query = query[:, :num_valid_heads]
         num_reqs, num_heads, _ = query.shape
         num_real_reqs = self._dsv4_batch_num_reqs_cpu[compressed_layer]
         if num_real_reqs > num_reqs:
@@ -885,50 +989,74 @@ class HiSparseCoordinator:
         miss_gpu = self.dsv4_miss_host_locs[
             compressed_layer, :num_real_reqs
         ]
-        query_cpu = torch.empty(
-            (num_real_reqs, num_heads, query.shape[-1]),
-            dtype=query.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
         miss_cpu = self._dsv4_cpu_miss_locs[compressed_layer][:num_real_reqs]
-        output_cpu = torch.zeros(
-            (num_reqs, num_heads, head_dim_v),
-            dtype=torch.bfloat16,
-            device="cpu",
-            pin_memory=True,
-        )
-        lse_cpu = torch.full(
-            (num_reqs, num_heads),
-            float("-inf"),
-            dtype=torch.float32,
-            device="cpu",
-            pin_memory=True,
-        )
+        buffers = self._dsv4_cpu_buffers.get(compressed_layer)
+        required_shape = (num_reqs, num_heads)
+        if buffers is None or buffers[0].shape[:2] != required_shape:
+            buffers = (
+                torch.empty(
+                    (*required_shape, query.shape[-1]),
+                    dtype=query.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                torch.empty(
+                    (*required_shape, head_dim_v),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                torch.empty(
+                    required_shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+            )
+            self._dsv4_cpu_buffers[compressed_layer] = buffers
+        query_cpu, output_cpu, lse_cpu = buffers
+        output_cpu.zero_()
+        lse_cpu.fill_(float("-inf"))
 
         current_stream = device_module.current_stream()
         self.dsv4_d2h_stream.wait_stream(current_stream)
-        copy_done = device_module.Event()
+        copy_done = self._dsv4_cpu_copy_events[compressed_layer]
         with device_module.stream(self.dsv4_d2h_stream):
             query_cpu.copy_(query[:num_real_reqs], non_blocking=True)
             miss_cpu.copy_(miss_gpu, non_blocking=True)
             copy_done.record(self.dsv4_d2h_stream)
 
         host_cache = self.mem_pool_host.kv_buffer[compressed_layer]
+        submit_ns = time.perf_counter_ns()
 
         def run_cpu_attention():
+            run_ns = time.perf_counter_ns()
             copy_done.synchronize()
+            compute_ns = time.perf_counter_ns()
             with torch.profiler.record_function(
                 f"dsv4_hisparse/cpu_miss_attention/layer_{physical_layer_id}"
             ):
-                return cpu_miss_attention(
-                    query=query_cpu,
+                attention_fn = (
+                    cpu_miss_attention
+                    if self.dsv4_cpu_attention_backend == "torch"
+                    or not hasattr(
+                        torch.ops.sgl_kernel, "dsv4_hisparse_cpu_attention"
+                    )
+                    else cpu_miss_attention_native
+                )
+                timing = attention_fn(
+                    query=query_cpu[:num_real_reqs],
                     miss_host_locs=miss_cpu,
                     host_cache=host_cache,
                     softmax_scale=softmax_scale,
                     head_dim_v=head_dim_v,
                     output=output_cpu[:num_real_reqs],
                     lse=lse_cpu[:num_real_reqs],
+                )
+                return (
+                    timing,
+                    (run_ns - submit_ns) * 1.0e-6,
+                    (compute_ns - run_ns) * 1.0e-6,
                 )
 
         assert self._dsv4_cpu_executor is not None
@@ -955,7 +1083,7 @@ class HiSparseCoordinator:
             return gpu_output
         future, output_cpu, lse_cpu, launch_ns = job
         wait_begin_ns = time.perf_counter_ns()
-        timing = future.result()
+        timing, executor_queue_ms, d2h_wait_ms = future.result()
         cpu_wait_ms = (time.perf_counter_ns() - wait_begin_ns) * 1.0e-6
         cpu_critical_ms = (time.perf_counter_ns() - launch_ns) * 1.0e-6
 
@@ -963,16 +1091,23 @@ class HiSparseCoordinator:
             merge_cpu_gpu_attention,
         )
 
+        merge_begin_ns = time.perf_counter_ns()
         with torch.profiler.record_function(
             f"dsv4_hisparse/lse_merge/layer_{physical_layer_id}"
         ):
-            merged = merge_cpu_gpu_attention(
-                gpu_output=gpu_output,
-                gpu_lse=gpu_lse,
+            num_valid_heads = output_cpu.shape[1]
+            merged_valid = merge_cpu_gpu_attention(
+                gpu_output=gpu_output[:, :, :num_valid_heads],
+                gpu_lse=gpu_lse[:, :num_valid_heads],
                 cpu_output=output_cpu,
                 cpu_lse=lse_cpu,
-                attn_sink=attn_sink,
+                attn_sink=(
+                    attn_sink[:num_valid_heads] if attn_sink is not None else None
+                ),
             )
+            gpu_output[:, :, :num_valid_heads].copy_(merged_valid)
+            merged = gpu_output
+        merge_submit_ms = (time.perf_counter_ns() - merge_begin_ns) * 1.0e-6
 
         if self.dsv4_profile:
             self._profile_add(physical_layer_id, "cpu_total_ms", timing.total_ms)
@@ -991,6 +1126,13 @@ class HiSparseCoordinator:
                 float(timing.miss_tokens),
             )
             self._profile_add(physical_layer_id, "cpu_blocked_ms", cpu_wait_ms)
+            self._profile_add(
+                physical_layer_id, "cpu_executor_queue_ms", executor_queue_ms
+            )
+            self._profile_add(physical_layer_id, "cpu_d2h_wait_ms", d2h_wait_ms)
+            self._profile_add(
+                physical_layer_id, "cpu_merge_submit_ms", merge_submit_ms
+            )
             self._profile_add(
                 physical_layer_id,
                 "cpu_critical_ms",

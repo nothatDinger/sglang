@@ -300,7 +300,7 @@ def test_classify_cache_residency_splits_without_mutating_state() -> None:
         hit_locs.cpu(), torch.tensor([[7, -1, 11, -1]], dtype=torch.int32)
     )
     assert torch.equal(
-        miss_locs.cpu(), torch.tensor([[-1, 6, -1, -1]], dtype=torch.int64)
+        miss_locs.cpu(), torch.tensor([[6, -1, -1, -1]], dtype=torch.int64)
     )
     assert miss_count.item() == 1
     assert torch.equal(state["device_buffer_tokens"], tokens_before)

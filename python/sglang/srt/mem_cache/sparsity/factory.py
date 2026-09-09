@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseCoordinator,
 )
 from sglang.srt.mem_cache.sparsity.runtime import (
+    DSV4_PREFETCH_MODE_SCOUT,
     load_hisparse_extra_config,
     resolve_dsv4_prefetch_mode,
 )
@@ -102,7 +103,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     dsv4_cpu_attention_backend = extra_config.pop(
         "dsv4_cpu_attention_backend", "auto"
     )
-    dsv4_cpu_threads = extra_config.pop("dsv4_cpu_threads", 0)
+    dsv4_cpu_threads = extra_config.pop("dsv4_cpu_threads", 8)
     dsv4_profile = extra_config.pop("dsv4_profile", False)
     dsv4_profile_log_interval = extra_config.pop(
         "dsv4_profile_log_interval", 100
@@ -130,8 +131,11 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         )
     if not isinstance(dsv4_cpu_threads, int) or isinstance(dsv4_cpu_threads, bool):
         raise ValueError("dsv4_cpu_threads must be an integer")
-    if dsv4_cpu_threads < 0:
-        raise ValueError("dsv4_cpu_threads must be non-negative")
+    if dsv4_cpu_threads < 0 or (
+        dsv4_prefetch_mode_selection.mode == DSV4_PREFETCH_MODE_SCOUT
+        and dsv4_cpu_threads == 0
+    ):
+        raise ValueError("dsv4_cpu_threads must be positive in ScoutAttention mode")
     if not isinstance(dsv4_profile, bool):
         raise ValueError("dsv4_profile must be a boolean")
     if (

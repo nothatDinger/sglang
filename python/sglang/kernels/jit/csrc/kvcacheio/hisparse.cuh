@@ -859,19 +859,30 @@ __global__ void classify_cache_residency_kernel(
     int64_t miss_stride) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
+  constexpr int HASH_SIZE = NUM_TOP_K * 2;
+  __shared__ int32_t hash_keys[HASH_SIZE];
+  __shared__ int16_t hash_vals[HASH_SIZE];
+  __shared__ int32_t block_miss_count;
   int32_t* req_hit_locs = hit_device_locs + bid * hit_stride;
   int64_t* req_miss_locs = miss_host_locs + bid * miss_stride;
 
   if (tid == 0) {
-    miss_count[bid] = 0;
+    block_miss_count = 0;
+  }
+  for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
+    hash_keys[i] = HASH_EMPTY;
+  }
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    req_hit_locs[i] = -1;
+    req_miss_locs[i] = -1;
   }
   __syncthreads();
 
   if (bid >= num_real_reqs[0]) {
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       req_hit_locs[i] = -1;
-      req_miss_locs[i] = -1;
     }
+    if (tid == 0) miss_count[bid] = 0;
     return;
   }
 
@@ -882,35 +893,63 @@ __global__ void classify_cache_residency_kernel(
   const int64_t* req_host_locs = host_cache_locs + rid * host_stride;
   const int32_t* req_top_k = top_k_tokens + bid * top_k_stride;
 
+  // Build a small top-k hash, then scan the hot buffer once. This changes the
+  // classifier from O(top_k * hot_buffer_size) to O(top_k + hot_buffer_size)
+  // without maintaining a second persistent per-request table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     const int32_t token = req_top_k[i];
-    int32_t device_loc = -1;
-    int64_t host_loc = -1;
-
     if (token >= 0 && token < seq_len) {
       if (seq_len <= HOT_BUFFER_SIZE) {
-        device_loc = req_device_locs[token];
+        req_hit_locs[i] = req_device_locs[token];
       } else if (token == seq_len - 1) {
-        device_loc = req_device_locs[HOT_BUFFER_SIZE];
+        req_hit_locs[i] = req_device_locs[HOT_BUFFER_SIZE];
       } else {
-        for (int slot = 0; slot < HOT_BUFFER_SIZE; ++slot) {
-          if (req_tokens[slot] == token) {
-            device_loc = req_device_locs[slot];
+        int slot = hash_slot(token, HASH_SIZE);
+        while (true) {
+          int32_t old = atomicCAS(&hash_keys[slot], HASH_EMPTY, token);
+          if (old == HASH_EMPTY || old == token) {
+            hash_vals[slot] = static_cast<int16_t>(i);
             break;
           }
-        }
-      }
-      if (device_loc < 0) {
-        host_loc = req_host_locs[token];
-        if (host_loc >= 0) {
-          atomicAdd(&miss_count[bid], 1);
+          slot = (slot + 1) % HASH_SIZE;
         }
       }
     }
-
-    req_hit_locs[i] = device_loc;
-    req_miss_locs[i] = host_loc;
   }
+  __syncthreads();
+
+  if (seq_len > HOT_BUFFER_SIZE) {
+    for (int slot = tid; slot < HOT_BUFFER_SIZE; slot += BLOCK_SIZE) {
+      const int32_t token = req_tokens[slot];
+      if (token >= 0) {
+        int h = hash_slot(token, HASH_SIZE);
+        while (true) {
+          const int32_t key = hash_keys[h];
+          if (key == token) {
+            req_hit_locs[hash_vals[h]] = req_device_locs[slot];
+            break;
+          }
+          if (key == HASH_EMPTY) break;
+          h = (h + 1) % HASH_SIZE;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // Compact host misses so D2H and CPU attention only consume miss_count rows.
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    const int32_t token = req_top_k[i];
+    if (token >= 0 && token < seq_len && req_hit_locs[i] < 0) {
+      const int64_t host_loc = req_host_locs[token];
+      if (host_loc >= 0) {
+        const int offset = atomicAdd(&block_miss_count, 1);
+        req_miss_locs[offset] = host_loc;
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) miss_count[bid] = block_miss_count;
 }
 
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>

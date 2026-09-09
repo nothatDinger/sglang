@@ -1,6 +1,8 @@
 """CPU partial attention for DeepSeek-V4 HiSparse host misses.
 
-This is the correctness/reference backend.  Its matrix multiplications go
+The native backend fuses page gather, FP8/UE8M0 decode, QK, FP32 softmax and PV
+behind one dispatcher call. The torch implementation remains an explicit
+correctness backend. Its matrix multiplications go
 through PyTorch's CPU dispatcher (oneDNN/MKL where available), which selects
 AVX2/AVX-512/AMX kernels for the host CPU at runtime.  The byte gather and FP8
 E4M3FN + UE8M0 dequantization are kept explicit so the page-padded host layout
@@ -31,6 +33,37 @@ class CpuAttentionTiming(NamedTuple):
     qk_softmax_ms: float
     pv_ms: float
     miss_tokens: int
+
+
+@torch.no_grad()
+def cpu_miss_attention_native(
+    *,
+    query: torch.Tensor,
+    miss_host_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    softmax_scale: float,
+    head_dim_v: int,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+) -> CpuAttentionTiming:
+    """Run the fused AVX-512/AMX-capable C++ host-miss kernel."""
+    op = getattr(torch.ops.sgl_kernel, "dsv4_hisparse_cpu_attention", None)
+    if op is None:
+        raise RuntimeError(
+            "sgl_kernel was built without dsv4_hisparse_cpu_attention"
+        )
+    begin_ns = time.perf_counter_ns()
+    miss_tokens = op(
+        query.contiguous(),
+        miss_host_locs.contiguous(),
+        host_cache,
+        softmax_scale,
+        head_dim_v,
+        output,
+        lse,
+    )
+    total_ms = (time.perf_counter_ns() - begin_ns) * 1.0e-6
+    return CpuAttentionTiming(total_ms, 0.0, 0.0, 0.0, int(miss_tokens))
 
 
 def _fp8_e4m3fn_to_float(raw: torch.Tensor) -> torch.Tensor:
@@ -209,4 +242,3 @@ def merge_cpu_gpu_attention(
     return gpu_output * gpu_weight.to(gpu_output.dtype) + cpu_output * cpu_weight.to(
         gpu_output.dtype
     )
-

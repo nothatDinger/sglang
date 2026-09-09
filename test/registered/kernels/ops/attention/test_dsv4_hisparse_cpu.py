@@ -1,10 +1,12 @@
 import math
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.dsv4.hisparse_cpu import (
     _fp8_e4m3fn_to_float,
     cpu_miss_attention,
+    cpu_miss_attention_native,
     gather_and_dequant_host_c4,
     merge_cpu_gpu_attention,
 )
@@ -71,6 +73,31 @@ def test_cpu_miss_attention_returns_partial_output_and_natural_lse():
     assert timing.miss_tokens == 1
 
 
+def test_native_cpu_miss_attention_matches_reference():
+    if not hasattr(torch.ops.sgl_kernel, "dsv4_hisparse_cpu_attention"):
+        pytest.skip("sgl_kernel CPU extension is not installed")
+    host_cache = torch.zeros((1, _PAGE_BYTES), dtype=torch.uint8)
+    _write_unit_c4_token(host_cache, 0)
+    query = torch.randn((1, 2, 512), dtype=torch.bfloat16)
+    miss_locs = torch.tensor([[0, -1]], dtype=torch.int64)
+    actual = torch.empty((1, 2, 512), dtype=torch.bfloat16)
+    actual_lse = torch.empty((1, 2), dtype=torch.float32)
+    expected = torch.empty_like(actual)
+    expected_lse = torch.empty_like(actual_lse)
+    kwargs = dict(
+        query=query,
+        miss_host_locs=miss_locs,
+        host_cache=host_cache,
+        softmax_scale=512**-0.5,
+        head_dim_v=512,
+    )
+    cpu_miss_attention(output=expected, lse=expected_lse, **kwargs)
+    timing = cpu_miss_attention_native(output=actual, lse=actual_lse, **kwargs)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-3)
+    assert timing.miss_tokens == 1
+
+
 def test_merge_cpu_gpu_attention_uses_disjoint_partition_lse():
     gpu_output = torch.ones((1, 1, 2, 4), dtype=torch.bfloat16)
     cpu_output = torch.full((1, 2, 4), 3.0, dtype=torch.bfloat16)
@@ -105,4 +132,3 @@ def test_merge_does_not_add_sink_twice_to_flashmla_lse():
     torch.testing.assert_close(
         merged.float(), torch.full_like(merged.float(), 5.0 / 3.0), atol=0.01, rtol=0
     )
-
