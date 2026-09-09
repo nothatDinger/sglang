@@ -324,14 +324,10 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
-# This host operator ships in the CUDA wheel as well as the CPU wheel. Keep
-# its x86 code generation equivalent to csrc/cpu/CMakeLists.txt.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    set_source_files_properties(
-        csrc/cpu/dsv4_hisparse_cpu_attention.cpp
-        PROPERTIES COMPILE_OPTIONS "-march=x86-64-v4;-mavx512bf16;-mamx-tile;-mamx-bf16"
-    )
-endif()
+# This host operator also ships in the CUDA wheel. Compile this translation
+# unit for the baseline host ISA; its BF16 GEMMs enter PyTorch/oneDNN, which
+# performs runtime AVX/AMX dispatch. This keeps CUDA wheels safe on pre-AVX512
+# GPU hosts while retaining AMX acceleration where it is available.
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)

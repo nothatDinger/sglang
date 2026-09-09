@@ -79,7 +79,9 @@ int64_t dsv4_hisparse_cpu_attention(
 
     // Dequantize once per request into a 32-row-aligned BF16 workspace. QK and
     // PV then dispatch as BF16 GEMMs (FP32 accumulation on oneDNN/AMX), shared
-    // by every valid head. Probabilities are materialized once in FP32.
+    // by every valid head. oneDNN selects the host ISA at runtime, so the CUDA
+    // wheel itself remains baseline-x86 compatible. Probabilities are
+    // materialized once in FP32.
     const int64_t padded = (count + 31) & ~int64_t(31);
     if (!kv_workspace.defined() || kv_workspace.size(0) < padded)
       kv_workspace = at::empty({padded, kDim}, query.options());

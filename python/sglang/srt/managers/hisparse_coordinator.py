@@ -1040,6 +1040,10 @@ class HiSparseCoordinator:
         with device_module.stream(self.dsv4_d2h_stream):
             query_cpu[:num_real_reqs].copy_(query[:num_real_reqs], non_blocking=True)
             miss_cpu.copy_(miss_gpu, non_blocking=True)
+            # ``query`` can be the temporary predicted-Q allocation owned by the
+            # prefetch stream. Tie its allocator lifetime to the D2H stream so
+            # the storage cannot be recycled before the async copy completes.
+            query.record_stream(self.dsv4_d2h_stream)
             copy_done.record(self.dsv4_d2h_stream)
 
         host_cache = self.mem_pool_host.kv_buffer[compressed_layer]
